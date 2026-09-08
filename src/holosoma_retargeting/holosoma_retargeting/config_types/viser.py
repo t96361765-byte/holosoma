@@ -22,11 +22,20 @@ class ViserConfig:
     object_urdf: str | None = None
     """Path to object URDF file (optional)."""
 
+    show_object: bool = False
+    """Whether to load and display the object URDF. Defaults to robot-only playback."""
+
+    object_position: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    """Static object root position (XYZ), used when assume_object_in_qpos is false."""
+
+    object_quaternion_wxyz: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
+    """Static object root quaternion (WXYZ), used when assume_object_in_qpos is false."""
+
     fps: int = 30
     """Frames per second for playback."""
 
     assume_object_in_qpos: bool = True
-    """Whether object pose is included in qpos array."""
+    """Whether the final seven qpos values contain dynamic object XYZ and WXYZ."""
 
     loop: bool = False
     """Whether to loop playback."""

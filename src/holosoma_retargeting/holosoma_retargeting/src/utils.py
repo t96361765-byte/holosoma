@@ -683,15 +683,28 @@ def create_new_scene_xml_file(
     return output_path
 
 
-def extract_foot_sticking_sequence_velocity(smpl_joints, demo_joints, foot_names, velocity_threshold=0.01):
+def extract_foot_sticking_sequence_velocity(
+    smpl_joints,
+    demo_joints,
+    foot_names,
+    velocity_threshold=0.01,
+    height_threshold=None,
+    ground_height=0.0,
+):
     """
-    Extract contact sequence from SMPL joint data based on x,y velocity of toe joints.
+    Extract contact sequence from toe XY velocity and an optional floor-height gate.
+
+    Supplying ``height_threshold`` prevents a stationary airborne foot from
+    being classified as support. The legacy velocity-only behavior is retained
+    when it is ``None``.
 
     Args:
         smpl_joints (np.ndarray): SMPL joint positions of shape (T, N, 3).
         demo_joints (list): List of joint names.
         foot_names (list): List of foot joint names [left_foot, right_foot].
         velocity_threshold (float): Threshold for xy velocity to determine contact.
+        height_threshold (float | None): Maximum toe height above the floor.
+        ground_height (float): World Z of the floor.
 
     Returns:
         list: List of contact dictionaries for each frame.
@@ -700,18 +713,69 @@ def extract_foot_sticking_sequence_velocity(smpl_joints, demo_joints, foot_names
     left_toe_idx = demo_joints.index(foot_names[0])
     right_toe_idx = demo_joints.index(foot_names[1])
 
-    # Check xy velocities
-    left_toe_positions = smpl_joints[:, left_toe_idx, :2]
-    right_toe_positions = smpl_joints[:, right_toe_idx, :2]
+    # Check XY velocities and, when requested, reject stationary airborne feet.
+    left_toe_positions = smpl_joints[:, left_toe_idx]
+    right_toe_positions = smpl_joints[:, right_toe_idx]
 
-    left_toe_velocity = np.linalg.norm(np.diff(left_toe_positions, axis=0), axis=1)
-    right_toe_velocity = np.linalg.norm(np.diff(right_toe_positions, axis=0), axis=1)
+    left_toe_velocity = np.linalg.norm(np.diff(left_toe_positions[:, :2], axis=0), axis=1)
+    right_toe_velocity = np.linalg.norm(np.diff(right_toe_positions[:, :2], axis=0), axis=1)
 
-    left_toe_velocity = np.concatenate([[velocity_threshold + 1], left_toe_velocity])
-    right_toe_velocity = np.concatenate([[velocity_threshold + 1], right_toe_velocity])
+    initial_velocity = 0.0 if height_threshold is not None else velocity_threshold + 1
+    left_toe_velocity = np.concatenate([[initial_velocity], left_toe_velocity])
+    right_toe_velocity = np.concatenate([[initial_velocity], right_toe_velocity])
+
+    left_contact = left_toe_velocity <= velocity_threshold
+    right_contact = right_toe_velocity <= velocity_threshold
+    if height_threshold is not None:
+        if height_threshold < 0:
+            raise ValueError("Foot contact height threshold must be non-negative")
+        max_contact_height = float(ground_height) + float(height_threshold)
+        left_contact &= left_toe_positions[:, 2] <= max_contact_height
+        right_contact &= right_toe_positions[:, 2] <= max_contact_height
 
     return [
-        {"L_Toe": left_toe_velocity[i] <= velocity_threshold, "R_Toe": right_toe_velocity[i] <= velocity_threshold}
+        {"L_Toe": bool(left_contact[i]), "R_Toe": bool(right_contact[i])}
+        for i in range(len(smpl_joints))
+    ]
+
+
+def extract_hand_sticking_sequence(
+    smpl_joints,
+    demo_joints,
+    hand_names=("L_Wrist", "R_Wrist"),
+    height_threshold=0.12,
+    velocity_threshold=0.015,
+    min_contact_frames=3,
+):
+    """Detect stable ground support from human wrist height and XYZ motion."""
+    if len(hand_names) != 2:
+        raise ValueError("hand_names must contain exactly one left and one right wrist name")
+    if min_contact_frames < 1:
+        raise ValueError("min_contact_frames must be at least 1")
+
+    contact_masks = []
+    for hand_name in hand_names:
+        hand_idx = demo_joints.index(hand_name)
+        positions = np.asarray(smpl_joints[:, hand_idx], dtype=float)
+        displacement = np.concatenate(
+            [[np.inf], np.linalg.norm(np.diff(positions, axis=0), axis=1)]
+        )
+        raw_contact = (positions[:, 2] <= height_threshold) & (displacement <= velocity_threshold)
+
+        # Reject short isolated detections while retaining complete accepted segments.
+        accepted_contact = np.zeros_like(raw_contact, dtype=bool)
+        segment_start = None
+        for frame_idx, is_contact in enumerate(np.append(raw_contact, False)):
+            if is_contact and segment_start is None:
+                segment_start = frame_idx
+            elif not is_contact and segment_start is not None:
+                if frame_idx - segment_start >= min_contact_frames:
+                    accepted_contact[segment_start:frame_idx] = True
+                segment_start = None
+        contact_masks.append(accepted_contact)
+
+    return [
+        {hand_names[0]: bool(contact_masks[0][i]), hand_names[1]: bool(contact_masks[1][i])}
         for i in range(len(smpl_joints))
     ]
 
@@ -766,9 +830,14 @@ def estimate_human_orientation(human_joints, joint_names, frame_idx=0):
     # For LAFAN
     if "Hips" in joint_names:
         hips_idx = joint_names.index("Hips")
-        spine_idx = joint_names.index("Spine")
-        left_hip_idx = joint_names.index("LeftUpLeg")
-        right_hip_idx = joint_names.index("RightUpLeg")
+        if "Chest2" in joint_names:
+            spine_idx = joint_names.index("Chest2")
+            left_hip_idx = joint_names.index("LeftHip")
+            right_hip_idx = joint_names.index("RightHip")
+        else:
+            spine_idx = joint_names.index("Spine")
+            left_hip_idx = joint_names.index("LeftUpLeg")
+            right_hip_idx = joint_names.index("RightUpLeg")
     else:
         # For SMPLH (OMOMO_new)
         hips_idx = joint_names.index("Pelvis")

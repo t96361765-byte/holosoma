@@ -37,6 +37,33 @@ LAFAN_DEMO_JOINTS = [
     "LeftHand",
 ]
 
+NOKOV_DEMO_JOINTS = LAFAN_DEMO_JOINTS.copy()
+POMMEL_DEMO_JOINTS = [
+    "Hips",
+    "Chest",
+    "Chest2",
+    "Chest3",
+    "Chest4",
+    "Neck",
+    "Head",
+    "RightCollar",
+    "RightShoulder",
+    "RightElbow",
+    "RightWrist",
+    "LeftCollar",
+    "LeftShoulder",
+    "LeftElbow",
+    "LeftWrist",
+    "RightHip",
+    "RightKnee",
+    "RightAnkle",
+    "RightToe",
+    "LeftHip",
+    "LeftKnee",
+    "LeftAnkle",
+    "LeftToe",
+]
+
 SMPLH_DEMO_JOINTS = [
     "Pelvis",
     "L_Hip",
@@ -295,10 +322,51 @@ JOINTS_MAPPINGS = {
         "RightFoot": "Ankle_Cross_Right",
     },
 }
+JOINTS_MAPPINGS[("nokov", "g1")] = JOINTS_MAPPINGS[("lafan", "g1")].copy()
+JOINTS_MAPPINGS[("nokov", "r1")] = {
+    **JOINTS_MAPPINGS[("nokov", "g1")],
+    "Spine1": "pelvis_link",
+    "LeftHand": "left_wrist_roll_link",
+    "RightHand": "right_wrist_roll_link",
+    "LeftFoot": "left_ankle_roll_link",
+    "RightFoot": "right_ankle_roll_link",
+    "LeftToeBase": "left_toe_link",
+    "RightToeBase": "right_toe_link",
+}
+POMMEL_G1_MAPPING = {
+    "Chest2": "pelvis_contour_link",
+    "LeftHip": "left_hip_pitch_link",
+    "RightHip": "right_hip_pitch_link",
+    "LeftKnee": "left_knee_link",
+    "RightKnee": "right_knee_link",
+    "LeftShoulder": "left_shoulder_roll_link",
+    "RightShoulder": "right_shoulder_roll_link",
+    "LeftElbow": "left_elbow_link",
+    "RightElbow": "right_elbow_link",
+    "LeftAnkle": "left_ankle_intermediate_1_link",
+    "RightAnkle": "right_ankle_intermediate_1_link",
+    "LeftToe": "left_ankle_roll_sphere_5_link",
+    "RightToe": "right_ankle_roll_sphere_5_link",
+    "LeftWrist": "left_rubber_hand_link",
+    "RightWrist": "right_rubber_hand_link",
+}
+JOINTS_MAPPINGS[("pommel", "g1")] = POMMEL_G1_MAPPING
+JOINTS_MAPPINGS[("pommel", "r1")] = {
+    **POMMEL_G1_MAPPING,
+    "Chest2": "pelvis_link",
+    "LeftWrist": "left_wrist_roll_link",
+    "RightWrist": "right_wrist_roll_link",
+    "LeftAnkle": "left_ankle_roll_link",
+    "RightAnkle": "right_ankle_roll_link",
+    "LeftToe": "left_toe_link",
+    "RightToe": "right_toe_link",
+}
 
 # Data format specific constants
 TOE_NAMES_BY_FORMAT = {
     "lafan": ["LeftToeBase", "RightToeBase"],
+    "nokov": ["LeftToeBase", "RightToeBase"],
+    "pommel": ["LeftToe", "RightToe"],
     "smplh": ["L_Toe", "R_Toe"],
     "mocap": ["LeftToeBase", "RightToeBase"],
     "smplx": ["L_Foot", "R_Foot"],
@@ -318,6 +386,14 @@ DATA_FORMAT_CONSTANTS: dict[str, FormatConstants] = {
     "mocap": {
         "default_human_height": 1.78,
     },
+    "nokov": {
+        "default_scale_factor": 1.27 / 1.75,
+    },
+    "pommel": {
+        # The reduced pommel skeleton is already metre-valued and is close to
+        # the G1 interaction-graph scale. Override from the CLI if required.
+        "default_scale_factor": 1.0,
+    },
 }
 
 # Unified registry: Maps format name to demo joints
@@ -325,6 +401,8 @@ DATA_FORMAT_CONSTANTS: dict[str, FormatConstants] = {
 # No need to update any Literal types - DataFormat is now str with runtime validation
 DEMO_JOINTS_REGISTRY: dict[str, list[str]] = {
     "lafan": LAFAN_DEMO_JOINTS,
+    "nokov": NOKOV_DEMO_JOINTS,
+    "pommel": POMMEL_DEMO_JOINTS,
     "smplh": SMPLH_DEMO_JOINTS,
     "mocap": MOCAP_DEMO_JOINTS,
     "smplx": SMPLX_DEMO_JOINTS,
@@ -404,6 +482,8 @@ class MotionDataConfig:
     def default_scale_factor(self) -> float | None:
         """Get default scale factor for this data format (None if calculated per subject)."""
         format_constants: FormatConstants = DATA_FORMAT_CONSTANTS.get(self.data_format, {})
+        if self.robot_type == "r1" and self.data_format == "nokov":
+            return self.robot_defaults["r1"]["robot_height"] / 1.75
         return format_constants.get("default_scale_factor")
 
     @property

@@ -16,7 +16,12 @@ from scipy.spatial.transform import Rotation  # type: ignore[import-untyped]
 from tqdm import tqdm
 from viser.extras import ViserUrdf  # type: ignore[import-not-found]
 
-from holosoma_retargeting.config_types.retargeter import FootLockConfig, SelfCollisionConfig
+from holosoma_retargeting.config_types.retargeter import (
+    ArmStraightnessConfig,
+    FootLockConfig,
+    HandStickingConfig,
+    SelfCollisionConfig,
+)
 
 # Add src to path for direct execution
 src_path = Path(__file__).parent.parent / "src"
@@ -30,6 +35,7 @@ from utils import (  # type: ignore[import-not-found,no-redef]  # noqa: E402
     calculate_laplacian_coordinates,
     calculate_laplacian_matrix,
     create_interaction_mesh,
+    extract_hand_sticking_sequence,
     get_adjacency_list,
     transform_points_local_to_world,
     transform_points_world_to_local,
@@ -55,7 +61,14 @@ class InteractionMeshRetargeter:
         collision_detection_threshold: float = 0.1,
         penetration_tolerance: float = 1e-3,
         foot_sticking_tolerance: float = 1e-3,
+        activate_foot_support_z: bool = False,
+        foot_support_ground_height: float = 0.0,
+        foot_support_z_soft_weight: float = 1000.0,
+        foot_support_z_hard_tolerance: float = 4e-3,
         foot_lock: FootLockConfig | None = None,
+        hand_sticking: HandStickingConfig | None = None,
+        hand_tracking_point_offset: tuple[float, float, float] = (0.0, 0.0, 0.0),
+        arm_straightness: ArmStraightnessConfig | None = None,
         self_collision: SelfCollisionConfig | None = None,
         visualize: bool = False,
         debug: bool = False,
@@ -67,8 +80,9 @@ class InteractionMeshRetargeter:
             1. [Cost] Minimize the Laplacian deformation in the object frame.
             2. [Constraint] Enforce the non-penetration constraints w/ the ground and (if activated) the object.
             3. [Constraint] Enforce the foot sticking constraints if activated.
-            4. [Constraint] Enforce the joint limits if activated.
-            5. [Constraint] Enforce trust region of dq.
+            4. [Constraint] Enforce the hand support sticking constraints if activated.
+            5. [Constraint] Enforce the joint limits if activated.
+            6. [Constraint] Enforce trust region of dq.
         The constraints are linearized and the costs are quadratic with a trust region.
 
         Args:
@@ -80,7 +94,15 @@ class InteractionMeshRetargeter:
             when the distance is smaller than this threshold.
             penetration_tolerance: tolerance for penetration when enforcing non-penetration constraints.
             foot_sticking_tolerance: tolerance for foot sticking constraints in x, y.
+            activate_foot_support_z: whether detected support soles are connected to the floor.
+            foot_support_ground_height: world Z of the floor plane.
+            foot_support_z_soft_weight: soft cost for all active sole spheres.
+            foot_support_z_hard_tolerance: hard Z window for the lowest active sphere per foot.
             foot_lock: configuration for explicit frame-range based foot locking constraints.
+            hand_sticking: configuration for detected hand support sticking constraints.
+            hand_tracking_point_offset: local XYZ offset of each robot hand point used by
+                the Laplacian wrist-tracking objective.
+            arm_straightness: configuration for geometric arm-direction tracking costs.
             nominal_tracking_tau: the time constant for the nominal tracking cost.
         """
 
@@ -107,7 +129,31 @@ class InteractionMeshRetargeter:
         self.smooth_weight = 0.2
         # Tolerance for foot sticking constraints in x, y.
         self.foot_sticking_tolerance = foot_sticking_tolerance
+        if foot_support_z_soft_weight < 0:
+            raise ValueError("foot_support_z_soft_weight must be non-negative")
+        if foot_support_z_hard_tolerance < 0:
+            raise ValueError("foot_support_z_hard_tolerance must be non-negative")
+        self.activate_foot_support_z = activate_foot_support_z
+        self.foot_support_ground_height = float(foot_support_ground_height)
+        self.foot_support_z_soft_weight = float(foot_support_z_soft_weight)
+        self.foot_support_z_hard_tolerance = float(foot_support_z_hard_tolerance)
         self._init_foot_lock(foot_lock)
+        self.hand_sticking = hand_sticking or HandStickingConfig()
+        self.hand_links = dict(
+            zip(self.hand_sticking.demo_joint_names, self.hand_sticking.robot_link_names, strict=True)
+        )
+        self.hand_point_offset = np.asarray(self.hand_sticking.point_offset, dtype=float)
+        tracking_offset = np.asarray(hand_tracking_point_offset, dtype=float)
+        if tracking_offset.shape != (3,) or not np.all(np.isfinite(tracking_offset)):
+            raise ValueError("hand_tracking_point_offset must contain three finite XYZ values")
+        hand_link_names = set(self.hand_sticking.robot_link_names)
+        self.laplacian_point_offsets = {
+            demo_name: tracking_offset
+            for demo_name, robot_link_name in self.laplacian_match_links.items()
+            if robot_link_name in hand_link_names
+        }
+
+        self.arm_straightness = arm_straightness or ArmStraightnessConfig()
         self._self_collision_config = self_collision
 
         # Setup visualization if requested
@@ -117,7 +163,7 @@ class InteractionMeshRetargeter:
         # Load Mujoco model
         if self.object_name == "ground":
             robot_xml_path = self.robot_model_path.replace(".urdf", ".xml")
-        elif self.object_name == "multi_boxes":
+        elif getattr(self.task_constants, "SCENE_XML_FILE", ""):
             robot_xml_path = self.task_constants.SCENE_XML_FILE
         else:
             robot_xml_path = self.robot_model_path.replace(".urdf", "_w_" + self.object_name + ".xml")
@@ -126,6 +172,13 @@ class InteractionMeshRetargeter:
         print("Loading robot model from: ", robot_xml_path)
 
         self.robot_data = mujoco.MjData(self.robot_model)
+        self.foot_support_center_heights = self._infer_foot_support_center_heights()
+        if self.hand_sticking.enable:
+            if self.object_name != "ground":
+                raise ValueError("Hand sticking currently supports ground-based robot_only tasks")
+            for link_name in self.hand_links.values():
+                if mujoco.mj_name2id(self.robot_model, mujoco.mjtObj.mjOBJ_BODY, link_name) == -1:
+                    raise ValueError(f"Hand sticking body {link_name} not found in MuJoCo model")
         self._init_self_collision(self._self_collision_config)
 
         if self.robot_data.qpos.shape[0] > 7 + self.task_constants.ROBOT_DOF:
@@ -171,6 +224,77 @@ class InteractionMeshRetargeter:
         self.w_nominal_tracking_init = w_nominal_tracking_init
         self.nominal_tracking_tau = nominal_tracking_tau
         self.track_nominal_indices = task_constants.NOMINAL_TRACKING_INDICES
+        self._init_arm_straightness()
+
+    def _infer_foot_support_center_heights(self) -> dict[str, float]:
+        """Infer sphere-center Z targets so the physical sphere bottoms touch the floor."""
+        targets: dict[str, float] = {}
+        for link in self.foot_links:
+            body_id = mujoco.mj_name2id(self.robot_model, mujoco.mjtObj.mjOBJ_BODY, link)
+            radius = 0.0
+            if body_id >= 0:
+                geom_ids = np.flatnonzero(self.robot_model.geom_bodyid == body_id)
+                sphere_radii = [
+                    float(self.robot_model.geom_size[geom_id, 0])
+                    for geom_id in geom_ids
+                    if self.robot_model.geom_type[geom_id] == mujoco.mjtGeom.mjGEOM_SPHERE
+                ]
+                if sphere_radii:
+                    radius = max(sphere_radii)
+            targets[link] = self.foot_support_ground_height + radius
+        return targets
+
+    @staticmethod
+    def _foot_side(link: str) -> str | None:
+        key = link.lower()
+        if "left" in key:
+            return "left"
+        if "right" in key:
+            return "right"
+        return None
+
+    def _init_arm_straightness(self) -> None:
+        """Resolve left/right arm chains for the active human data format."""
+        if self.arm_straightness.weight < 0:
+            raise ValueError("arm straightness weight must be non-negative")
+
+        arm_chain_candidates = (
+            ("LeftArm", "LeftForeArm", "LeftHand"),
+            ("RightArm", "RightForeArm", "RightHand"),
+            ("L_Shoulder", "L_Elbow", "L_Wrist"),
+            ("R_Shoulder", "R_Elbow", "R_Wrist"),
+            ("LeftShoulder", "LeftElbow", "LeftWrist"),
+            ("RightShoulder", "RightElbow", "RightWrist"),
+            ("LeftArm", "LeftForeArm", "LeftHandMiddle3"),
+            ("RightArm", "RightForeArm", "RightHandMiddle3"),
+        )
+        self.arm_chains = tuple(
+            chain
+            for chain in arm_chain_candidates
+            if all(name in self.demo_joints and name in self.laplacian_match_links for name in chain)
+        )
+        if self.arm_straightness.enable and len(self.arm_chains) != 2:
+            raise ValueError(
+                "Arm straightness requires exactly one left and one right shoulder-elbow-hand mapping; "
+                f"resolved {self.arm_chains}"
+            )
+
+    def _get_arm_direction_targets(
+        self,
+        mapped_points: np.ndarray,
+    ) -> dict[tuple[str, str], np.ndarray]:
+        """Use each human shoulder-to-wrist direction for both robot arm segments."""
+        point_by_name = dict(zip(self.laplacian_match_links, mapped_points, strict=True))
+        targets: dict[tuple[str, str], np.ndarray] = {}
+        for shoulder, elbow, hand in self.arm_chains:
+            full_arm_direction = point_by_name[hand] - point_by_name[shoulder]
+            full_arm_length = np.linalg.norm(full_arm_direction)
+            if full_arm_length <= 1e-8:
+                continue
+            full_arm_direction /= full_arm_length
+            targets[(shoulder, elbow)] = full_arm_direction
+            targets[(elbow, hand)] = full_arm_direction
+        return targets
 
     def _init_foot_lock(self, foot_lock: FootLockConfig | None) -> None:
         """Initialize foot lock configuration and normalize window mappings."""
@@ -379,6 +503,7 @@ class InteractionMeshRetargeter:
         object_points_local_demo,
         object_points_local,
         foot_sticking_sequences,
+        hand_sticking_sequences=None,
         q_a_init=None,
         q_nominal_list=None,
         original=True,
@@ -396,6 +521,7 @@ class InteractionMeshRetargeter:
             object_points_local (np.ndarray | list[np.ndarray]): Current object points in local frame.
                 Single array for static points, or list of num_frames arrays for per-frame points.
             foot_sticking_sequences (list): List of foot sticking sequences for each frame.
+            hand_sticking_sequences (list, optional): Detected hand support state for each frame.
             q_a_init (np.ndarray, optional): Initial robot configuration.
             q_a_nominal (np.ndarray, optional): Nominal robot configuration.
 
@@ -403,6 +529,28 @@ class InteractionMeshRetargeter:
             tuple: (retargeted_motions, obj_pts_demo_list, obj_pts_list, tetrahedra)
         """
         num_frames = human_joint_motions.shape[0]
+        needs_support_detection = self.hand_sticking.enable or (
+            self.arm_straightness.enable and self.arm_straightness.contact_only
+        )
+        if needs_support_detection:
+            if hand_sticking_sequences is None:
+                hand_sticking_sequences = extract_hand_sticking_sequence(
+                    human_joint_motions,
+                    self.demo_joints,
+                    hand_names=self.hand_sticking.demo_joint_names,
+                    height_threshold=self.hand_sticking.height_threshold,
+                    velocity_threshold=self.hand_sticking.velocity_threshold,
+                    min_contact_frames=self.hand_sticking.min_contact_frames,
+                )
+            if len(hand_sticking_sequences) != num_frames:
+                raise ValueError("hand_sticking_sequences length must match the motion length")
+            hand_counts = {
+                name: sum(frame[name] for frame in hand_sticking_sequences)
+                for name in hand_sticking_sequences[0]
+            }
+            print(f"Detected hand support frames: {hand_counts}")
+        else:
+            hand_sticking_sequences = [dict.fromkeys(self.hand_links, False) for _ in range(num_frames)]
         if isinstance(object_points_local_demo, list):
             assert len(object_points_local_demo) == num_frames, (
                 f"object_points_local_demo length {len(object_points_local_demo)} != num_frames {num_frames}"
@@ -417,9 +565,11 @@ class InteractionMeshRetargeter:
             q_locked_list = np.zeros((num_frames, self.nq))
             q_locked_list[0, self.q_a_indices] = q_a_init
 
-        q_locked_list[:, -7:] = object_poses_augmented
+        if self.has_dynamic_object:
+            q_locked_list[:, -7:] = object_poses_augmented
         q = np.copy(q_locked_list[0])
         retargeted_motions = [q]
+        hand_anchors = dict.fromkeys(self.hand_links)
 
         tetrahedra = []
         obj_pts_demo_list = []  # scaled object pts
@@ -429,6 +579,19 @@ class InteractionMeshRetargeter:
 
         with tqdm(range(num_frames)) as pbar:
             for i in pbar:
+                if self.hand_sticking.enable:
+                    for hand_name, is_contact in hand_sticking_sequences[i].items():
+                        if not is_contact:
+                            hand_anchors[hand_name] = None
+                        elif hand_anchors[hand_name] is None:
+                            _, previous_hand_positions, _ = self._calc_manipulator_jacobians(
+                                q,
+                                links={hand_name: self.hand_links[hand_name]},
+                                obj_frame=False,
+                                point_offsets=self.hand_point_offset,
+                            )
+                            hand_anchors[hand_name] = previous_hand_positions[hand_name]
+
                 # Get object poses and transform points
                 object_quat_demo = object_poses[i, 3:]
                 object_trans_demo = object_poses[i, :3]
@@ -442,6 +605,11 @@ class InteractionMeshRetargeter:
                     human_mapped_joints_in_object = transform_points_world_to_local(
                         object_quat_demo, object_trans_demo, human_mapped_joints
                     )
+                arm_direction_targets = (
+                    self._get_arm_direction_targets(human_mapped_joints_in_object)
+                    if self.arm_straightness.enable
+                    else {}
+                )
 
                 # Per-frame or static object points
                 obj_pts_demo_i = (
@@ -491,6 +659,13 @@ class InteractionMeshRetargeter:
                     adj_list=adj_list,
                     obj_pts_local=obj_pts_i,
                     foot_sticking=foot_sticking_sequences[i],
+                    hand_anchors=hand_anchors,
+                    arm_straightness_active=(
+                        hand_sticking_sequences[i]
+                        if self.arm_straightness.contact_only
+                        else dict.fromkeys(self.hand_links, self.arm_straightness.enable)
+                    ),
+                    arm_direction_targets=arm_direction_targets,
                     w_nominal_tracking=w_nominal_tracking,
                     q_a_nominal=(q_nominal_list[i, self.q_a_indices] if q_nominal_list is not None else None),
                     init_t=i == 0,
@@ -500,7 +675,7 @@ class InteractionMeshRetargeter:
                 if self.debug:
                     robot_link_positions = self._get_robot_link_positions(
                         q, self.laplacian_match_links.values()
-                    )  # 15 X 3
+                    )
                     robot_kpts_handle_list = self.draw_keypoints(
                         robot_link_positions, name="robot_kpts", rgba=(0, 1, 0, 1)
                     )
@@ -529,14 +704,28 @@ class InteractionMeshRetargeter:
                 handle.remove()
             robot_kpts_handle_list.clear()
 
-        # Save results
-        np.savez(
-            dest_res_path,
-            qpos=np.array(retargeted_motions)[1:],
-            human_joints=human_joint_motions,
-            fps=30,
-            cost=cost,
-        )
+        # Save the motion and enough object metadata for standalone playback.
+        # Fixed objects are intentionally not appended to qpos because they do
+        # not move, but their world pose remains part of the NPZ result.
+        result = {
+            "qpos": np.array(retargeted_motions)[1:],
+            "human_joints": human_joint_motions,
+            "fps": 30,
+            "cost": cost,
+        }
+        if self.object_name != "ground" and self.object_model_path:
+            result["object_urdf"] = str(Path(self.object_model_path).resolve())
+            result["object_pose_in_qpos"] = bool(self.has_dynamic_object)
+            if not self.has_dynamic_object:
+                result["object_position"] = np.asarray(
+                    getattr(self.task_constants, "STATIC_OBJECT_POSITION", np.zeros(3)),
+                    dtype=float,
+                )
+                result["object_quaternion_wxyz"] = np.asarray(
+                    getattr(self.task_constants, "STATIC_OBJECT_QUAT", [1.0, 0.0, 0.0, 0.0]),
+                    dtype=float,
+                )
+        np.savez(dest_res_path, **result)
         print("Saving results to path:", dest_res_path)
 
         if self.visualize:
@@ -551,6 +740,18 @@ class InteractionMeshRetargeter:
                 viser_object=self.viser_object,
                 object_base_frame=getattr(self, "object_base", None) if self.viser_object else None,
                 contains_object_in_qpos=bool(self.viser_object) and bool(self.has_dynamic_object),
+                static_object_position=tuple(
+                    np.asarray(
+                        getattr(self.task_constants, "STATIC_OBJECT_POSITION", np.zeros(3)),
+                        dtype=float,
+                    )
+                ),
+                static_object_quaternion_wxyz=tuple(
+                    np.asarray(
+                        getattr(self.task_constants, "STATIC_OBJECT_QUAT", [1.0, 0.0, 0.0, 0.0]),
+                        dtype=float,
+                    )
+                ),
                 initial_fps=30,
                 initial_interp_mult=2,
                 loop=False,
@@ -582,6 +783,9 @@ class InteractionMeshRetargeter:
         adj_list: list[list[int]],
         obj_pts_local: np.ndarray,
         foot_sticking: tuple[bool, bool],
+        hand_anchors: dict[str, np.ndarray | None] | None = None,
+        arm_straightness_active: dict[str, bool] | None = None,
+        arm_direction_targets: dict[tuple[str, str], np.ndarray] | None = None,
         w_nominal_tracking: float = 0.0,
         q_a_nominal: np.ndarray | None = None,
         verbose=False,
@@ -594,6 +798,9 @@ class InteractionMeshRetargeter:
             q_a_n_last: the last optimized robot configuration at current time step.
             q_t_last: the robot and object configuration at the last time step.
             foot_sticking: a sequence of booleans indicating whether the foot [left, right] is sticking to the ground.
+            hand_anchors: fixed world-frame pan-tip anchors for active hand support segments.
+            arm_straightness_active: per-side state used to activate arm-direction costs.
+            arm_direction_targets: human upper-arm/forearm unit directions for this frame.
             smpl_joints: the (possibly scaled) SMPL joint positions to match for IK.
             q_ref: the reference robot configuration.
             smpl_joints_original: the original SMPL joint positions (used for contact matching).
@@ -609,7 +816,10 @@ class InteractionMeshRetargeter:
 
         # Compute Laplacian pieces
         J_OC_dict, p_OC_dict, _ = self._calc_manipulator_jacobians(
-            q, links=self.laplacian_match_links, obj_frame=(self.object_name != "ground")
+            q,
+            links=self.laplacian_match_links,
+            obj_frame=(self.object_name != "ground"),
+            point_offsets=self.laplacian_point_offsets,
         )
         robot_link_keys = list(self.laplacian_match_links.keys())
         V_r = len(robot_link_keys)
@@ -644,6 +854,7 @@ class InteractionMeshRetargeter:
 
         # Constraints list
         constraints = []
+        foot_support_z_costs = []
 
         # Linear equality
         constraints += [cp.Constant(J_L[:, self.q_a_indices]) @ dqa - lap_var == -lap0_vec]
@@ -668,10 +879,12 @@ class InteractionMeshRetargeter:
                 if left_key is None or right_key is None:
                     raise ValueError("foot_sticking must include one left* and one right* key")
 
+                active_foot_links: dict[str, tuple[np.ndarray, np.ndarray]] = {}
                 for key, J_WF in J_WF_dict.items():
                     apply_left = ("left" in key) and foot_sticking[left_key]
                     apply_right = ("right" in key) and foot_sticking[right_key]
                     if apply_left or apply_right:
+                        active_foot_links[key] = (J_WF, p_WF_dict[key])
                         p_lb = p_WF_t_last_dict[key] - p_WF_dict[key] - self.foot_sticking_tolerance
                         p_ub = p_lb + 2 * self.foot_sticking_tolerance  # symmetric window
 
@@ -679,6 +892,37 @@ class InteractionMeshRetargeter:
                         constraints += [
                             Jxy @ dqa >= p_lb[:2],
                             Jxy @ dqa <= p_ub[:2],
+                        ]
+
+                if self.activate_foot_support_z:
+                    # Pull every active sole sphere toward the floor, while
+                    # hard-pinning only the currently lowest sphere per side.
+                    # This permits toe/heel support without forcing all four
+                    # points into an incompatible perfectly flat pose.
+                    for key, (J_WF, point) in active_foot_links.items():
+                        target_z = self.foot_support_center_heights[key]
+                        z_linearized = point[2] + cp.Constant(J_WF[2]) @ dqa
+                        foot_support_z_costs.append(cp.sum_squares(z_linearized - target_z))
+
+                    for side in ("left", "right"):
+                        side_links = [
+                            (key, value)
+                            for key, value in active_foot_links.items()
+                            if self._foot_side(key) == side
+                        ]
+                        if not side_links:
+                            continue
+                        lowest_key, (lowest_J, lowest_point) = min(
+                            side_links,
+                            key=lambda item: (
+                                item[1][1][2] - self.foot_support_center_heights[item[0]]
+                            ),
+                        )
+                        z_delta = self.foot_support_center_heights[lowest_key] - lowest_point[2]
+                        Jz = lowest_J[2]
+                        constraints += [
+                            Jz @ dqa >= z_delta - self.foot_support_z_hard_tolerance,
+                            Jz @ dqa <= z_delta + self.foot_support_z_hard_tolerance,
                         ]
 
             # Foot lock windows: pin Z to floor within configured frame ranges
@@ -694,6 +938,24 @@ class InteractionMeshRetargeter:
                         Jz @ dqa >= z_delta - self.foot_lock.tolerance,
                         Jz @ dqa <= z_delta + self.foot_lock.tolerance,
                     ]
+
+        # Hand support sticking: keep each active fist-pan tip near one fixed XYZ anchor.
+        if self.hand_sticking.enable and hand_anchors is not None:
+            J_WH_dict, p_WH_dict, _ = self._calc_manipulator_jacobians(
+                q,
+                links=self.hand_links,
+                obj_frame=False,
+                point_offsets=self.hand_point_offset,
+            )
+            for hand_name, anchor in hand_anchors.items():
+                if anchor is None:
+                    continue
+                delta = anchor - p_WH_dict[hand_name]
+                J_WH = J_WH_dict[hand_name]
+                constraints += [
+                    J_WH @ dqa >= delta - self.hand_sticking.tolerance,
+                    J_WH @ dqa <= delta + self.hand_sticking.tolerance,
+                ]
 
         # Non-penetration constraints
         Js, phis = self._update_jacobians_and_phis_from_q(q)
@@ -727,6 +989,13 @@ class InteractionMeshRetargeter:
 
         obj_terms.append(cp.sum_squares(cp.multiply(sqrt_w3, lap_var - target_lap_vec)))
 
+        if foot_support_z_costs and self.foot_support_z_soft_weight > 0:
+            obj_terms.append(
+                self.foot_support_z_soft_weight
+                / len(foot_support_z_costs)
+                * cp.sum(foot_support_z_costs)
+            )
+
         # nominal tracking for selected indices
         if (w_nominal_tracking > 0) and (q_a_nominal is not None):
             idx = np.array(self.track_nominal_indices, dtype=int)
@@ -737,6 +1006,45 @@ class InteractionMeshRetargeter:
         # Q_diag cost
         Qd = np.asarray(self.Q_diag, dtype=float).reshape(-1)
         obj_terms.append(cp.sum_squares(cp.multiply(np.sqrt(Qd), dqa + q_a_n_last)))
+
+        # Geometric arm straightness: make both robot segments track the same
+        # human shoulder->wrist unit direction. Linearizing the normalized
+        # robot segments removes arm-length differences from the objective.
+        if (
+            self.arm_straightness.enable
+            and arm_straightness_active is not None
+            and arm_direction_targets is not None
+        ):
+            for shoulder, elbow, hand in self.arm_chains:
+                hand_side = "left" if hand.lower().startswith("l") else "right"
+                side_is_active = any(
+                    bool(is_active)
+                    for name, is_active in arm_straightness_active.items()
+                    if ("left" if name.lower().startswith("l") else "right") == hand_side
+                )
+                if not side_is_active:
+                    continue
+                for start, end in ((shoulder, elbow), (elbow, hand)):
+                    target_direction = arm_direction_targets.get((start, end))
+                    if target_direction is None:
+                        continue
+                    segment = p_OC_dict[end] - p_OC_dict[start]
+                    segment_length = np.linalg.norm(segment)
+                    if segment_length <= 1e-8:
+                        continue
+                    current_direction = segment / segment_length
+                    segment_jacobian = J_OC_dict[end] - J_OC_dict[start]
+                    direction_jacobian = (
+                        (np.eye(3) - np.outer(current_direction, current_direction))
+                        / segment_length
+                        @ segment_jacobian
+                    )
+                    direction_error = (
+                        direction_jacobian @ dqa + current_direction - target_direction
+                    )
+                    obj_terms.append(
+                        self.arm_straightness.weight * cp.sum_squares(direction_error)
+                    )
 
         # Smoothness cost
         dqa_smooth = q_t_last[self.q_a_indices] - q_a_n_last
@@ -851,6 +1159,9 @@ class InteractionMeshRetargeter:
         adj_list: list[list[int]],
         obj_pts_local: np.ndarray,
         foot_sticking: tuple[bool, bool],
+        hand_anchors: dict[str, np.ndarray | None] | None = None,
+        arm_straightness_active: dict[str, bool] | None = None,
+        arm_direction_targets: dict[tuple[str, str], np.ndarray] | None = None,
         w_nominal_tracking: float = 0.0,
         q_a_nominal: np.ndarray | None = None,
         init_t: bool = False,
@@ -869,6 +1180,9 @@ class InteractionMeshRetargeter:
                 adj_list=adj_list,
                 obj_pts_local=obj_pts_local,
                 foot_sticking=foot_sticking,
+                hand_anchors=hand_anchors,
+                arm_straightness_active=arm_straightness_active,
+                arm_direction_targets=arm_direction_targets,
                 q_a_nominal=q_a_nominal,
                 w_nominal_tracking=w_nominal_tracking,
                 init_t=init_t,
@@ -933,8 +1247,14 @@ class InteractionMeshRetargeter:
                 object_quat = q[-4:]
                 object_pos = q[-7:-4]
             else:
-                object_quat = np.asarray([1, 0, 0, 0])
-                object_pos = np.zeros(3)
+                object_quat = np.asarray(
+                    getattr(self.task_constants, "STATIC_OBJECT_QUAT", [1, 0, 0, 0]),
+                    dtype=float,
+                )
+                object_pos = np.asarray(
+                    getattr(self.task_constants, "STATIC_OBJECT_POSITION", np.zeros(3)),
+                    dtype=float,
+                )
 
             # Update object base frame
             self.object_base.position = object_pos
@@ -1291,7 +1611,7 @@ class InteractionMeshRetargeter:
         q: np.ndarray,
         links: dict[str, str],
         obj_frame: bool = False,
-        point_offsets: np.ndarray | None = None,
+        point_offsets: np.ndarray | dict[str, np.ndarray] | None = None,
     ):
         """Compute position-based Jacobians using MuJoCo."""
         J_XC_dict = {}
@@ -1304,9 +1624,18 @@ class InteractionMeshRetargeter:
                 obj_rot = Rotation.from_quat([obj_quat[1], obj_quat[2], obj_quat[3], obj_quat[0]]).as_matrix()
                 obj_rot_inv = obj_rot.T
             else:
-                obj_rot = Rotation.from_quat([0, 0, 0, 1]).as_matrix()
+                static_quat = np.asarray(
+                    getattr(self.task_constants, "STATIC_OBJECT_QUAT", [1.0, 0.0, 0.0, 0.0]),
+                    dtype=float,
+                )
+                obj_rot = Rotation.from_quat(
+                    [static_quat[1], static_quat[2], static_quat[3], static_quat[0]]
+                ).as_matrix()
                 obj_rot_inv = obj_rot.T
-                obj_pos = np.zeros(3)
+                obj_pos = np.asarray(
+                    getattr(self.task_constants, "STATIC_OBJECT_POSITION", np.zeros(3)),
+                    dtype=float,
+                )
 
         q_mujoco = q.copy()
         self.robot_data.qpos[:] = q_mujoco
@@ -1316,13 +1645,15 @@ class InteractionMeshRetargeter:
         for name, link_name in links.items():
             body_id = mujoco.mj_name2id(self.robot_model, mujoco.mjtObj.mjOBJ_BODY, link_name)
 
-            if point_offsets is not None:
+            if isinstance(point_offsets, dict):
+                pC_B = np.asarray(point_offsets.get(name, np.zeros(3)), dtype=float)
+            elif point_offsets is not None:
                 pC_B = point_offsets
             else:
                 pC_B = np.zeros(3)
 
             J = self._calc_contact_jacobian_from_point(body_id, pC_B)
-            pos_world = self.robot_data.xpos[body_id]
+            pos_world = self.robot_data.xpos[body_id] + self.robot_data.xmat[body_id].reshape(3, 3) @ pC_B
 
             if obj_frame:
                 p_XC = obj_rot_inv @ (pos_world - obj_pos)

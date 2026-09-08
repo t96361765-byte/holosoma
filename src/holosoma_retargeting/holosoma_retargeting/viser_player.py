@@ -20,17 +20,28 @@ from holosoma_retargeting.src.viser_utils import create_motion_control_sliders  
 
 
 def load_npz(npz_path: str):
-    data = np.load(npz_path, allow_pickle=True)
-    # expected: qpos [T, ?], and optional fps
-    qpos = data["qpos"]
-    fps = int(data["fps"]) if "fps" in data else 30
-    return qpos, fps
+    with np.load(npz_path, allow_pickle=False) as data:
+        qpos = np.asarray(data["qpos"])
+        fps = int(data["fps"]) if "fps" in data else 30
+        metadata: dict[str, object] = {}
+        if "object_urdf" in data:
+            metadata["object_urdf"] = str(np.asarray(data["object_urdf"]).item())
+        if "object_pose_in_qpos" in data:
+            metadata["object_pose_in_qpos"] = bool(np.asarray(data["object_pose_in_qpos"]).item())
+        if "object_position" in data:
+            metadata["object_position"] = tuple(np.asarray(data["object_position"], dtype=float))
+        if "object_quaternion_wxyz" in data:
+            metadata["object_quaternion_wxyz"] = tuple(
+                np.asarray(data["object_quaternion_wxyz"], dtype=float)
+            )
+    return qpos, fps, metadata
 
 
 def make_player(
     config: ViserConfig,
     qpos: np.ndarray,
     fps: int | None = None,
+    object_metadata: dict[str, object] | None = None,
 ):
     """
     qpos layout (MuJoCo order):
@@ -52,9 +63,20 @@ def make_player(
     robot_urdf_y = yourdfpy.URDF.load(config.robot_urdf, load_meshes=True, build_scene_graph=True)
     vr = ViserUrdf(server, urdf_or_path=robot_urdf_y, root_node_name="/robot")
 
+    object_metadata = object_metadata or {}
+    object_urdf = config.object_urdf or object_metadata.get("object_urdf")
+    object_position = object_metadata.get("object_position", config.object_position)
+    object_quaternion_wxyz = object_metadata.get(
+        "object_quaternion_wxyz", config.object_quaternion_wxyz
+    )
+
     vo = None
-    if config.object_urdf:
-        object_urdf_y = yourdfpy.URDF.load(config.object_urdf, load_meshes=True, build_scene_graph=True)
+    if config.show_object:
+        if object_urdf is None:
+            raise ValueError(
+                "--show-object requires object_urdf metadata in the NPZ or an explicit --object-urdf"
+            )
+        object_urdf_y = yourdfpy.URDF.load(str(object_urdf), load_meshes=True, build_scene_graph=True)
         vo = ViserUrdf(server, urdf_or_path=object_urdf_y, root_node_name="/object")
 
     # A tiny grid
@@ -63,6 +85,18 @@ def make_player(
     # Figure robot DOF from actuated limits in ViserUrdf
     joint_limits = vr.get_actuated_joint_limits()
     robot_dof = len(joint_limits)
+    expected_robot_qpos = 7 + robot_dof
+    if qpos.ndim != 2 or qpos.shape[1] < expected_robot_qpos:
+        raise ValueError(
+            f"qpos must have at least {expected_robot_qpos} columns for this robot; got {qpos.shape}"
+        )
+    metadata_pose_in_qpos = object_metadata.get("object_pose_in_qpos")
+    object_pose_in_qpos = config.assume_object_in_qpos
+    if metadata_pose_in_qpos is not None:
+        object_pose_in_qpos = object_pose_in_qpos and bool(metadata_pose_in_qpos)
+    contains_object_in_qpos = (
+        config.show_object and object_pose_in_qpos and qpos.shape[1] >= expected_robot_qpos + 7
+    )
 
     # Use fps from config if not provided, otherwise use the one from npz file
     actual_fps = fps if fps is not None else config.fps
@@ -89,29 +123,37 @@ def make_player(
         robot_base_frame=robot_root,
         motion_sequence=qpos,
         robot_dof=robot_dof,
-        viser_object=vo if config.assume_object_in_qpos else None,
-        object_base_frame=object_root if config.assume_object_in_qpos else None,
-        contains_object_in_qpos=config.assume_object_in_qpos,
+        viser_object=vo,
+        object_base_frame=object_root if vo is not None else None,
+        contains_object_in_qpos=contains_object_in_qpos,
+        static_object_position=object_position,
+        static_object_quaternion_wxyz=object_quaternion_wxyz,
         initial_fps=actual_fps,
         initial_interp_mult=config.visual_fps_multiplier,
         loop=config.loop,
     )
     n_frames = int(qpos.shape[0])
-    print(
-        f"[viser_player] Loaded {n_frames} frames | robot_dof={robot_dof} | "
-        f"object={'yes' if (config.object_urdf and config.assume_object_in_qpos) else 'no'}"
-    )
+    object_mode = "none"
+    if vo is not None:
+        object_mode = "qpos" if contains_object_in_qpos else "static"
+    print(f"[viser_player] Loaded {n_frames} frames | robot_dof={robot_dof} | object={object_mode}")
+    if object_mode == "static":
+        print(
+            "[viser_player] Static object pose | "
+            f"position={object_position} | wxyz={object_quaternion_wxyz}"
+        )
     print("Open the viewer URL printed above. Close the process (Ctrl+C) to exit.")
     return server
 
 
 def main(cfg: ViserConfig) -> None:
     """Main function for viser player."""
-    qpos, fps = load_npz(cfg.qpos_npz)
+    qpos, fps, object_metadata = load_npz(cfg.qpos_npz)
     make_player(
         config=cfg,
         qpos=qpos,
         fps=fps,
+        object_metadata=object_metadata,
     )
 
     # keep process alive

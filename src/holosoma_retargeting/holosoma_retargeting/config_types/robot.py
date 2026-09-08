@@ -17,6 +17,7 @@ class RobotDefaults(TypedDict):
 
 _ROBOT_DEFAULTS: dict[str, RobotDefaults] = {
     "g1": {"robot_dof": 29, "robot_height": 1.32, "object_name": "ground"},
+    "r1": {"robot_dof": 26, "robot_height": 1.2302, "object_name": "ground"},
     "t1": {"robot_dof": 23, "robot_height": 1.2, "object_name": "ground"},
 }
 
@@ -130,6 +131,8 @@ class RobotConfig:
         if self.foot_sticking_links is not None:
             return self.foot_sticking_links
 
+        if self.robot_type == "r1":
+            return [f"{side}_sole_{i}_link" for side in ("left", "right") for i in range(1, 5)]
         if self.robot_type == "g1":
             return [
                 "left_ankle_roll_sphere_1_link",
@@ -167,6 +170,9 @@ class RobotConfig:
             return self.manual_lb
 
         base: dict[str, float] = {"3": -1.0, "4": -1.0, "5": -1.0, "6": -1.0}  # quaternion bounds
+        if self.robot_type == "r1":
+            # Prepared R1 model: head pitch/yaw are actuated indices 24/25.
+            base.update({"31": 0.0, "32": 0.0})
 
         if self.robot_type == "g1":
             base.update(
@@ -192,6 +198,8 @@ class RobotConfig:
             return self.manual_ub
 
         base: dict[str, float] = {"3": 1.0, "4": 1.0, "5": 1.0, "6": 1.0}  # quaternion bounds
+        if self.robot_type == "r1":
+            base.update({"31": 0.0, "32": 0.0})
 
         if self.robot_type == "g1":
             base.update(

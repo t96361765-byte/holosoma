@@ -8,7 +8,6 @@ from pathlib import Path
 
 import numpy as np
 import tyro
-from lafan1 import extract, utils  # type: ignore[import-not-found]
 
 
 def extract_global_positions(bvh_file_path):
@@ -26,11 +25,15 @@ def extract_global_positions(bvh_file_path):
             - 'num_frames': number of frames
             - 'num_joints': number of joints
     """
+    # LAFAN remains an optional external dependency; NOKOV parsing does not
+    # require it.
+    from lafan1 import extract, utils  # type: ignore[import-not-found]  # noqa: PLC0415
+
     # Read BVH file
     anim = extract.read_bvh(bvh_file_path)
 
     # Compute global positions using Forward Kinematics
-    global_quats, global_positions = utils.quat_fk(anim.quats, anim.pos, anim.parents)
+    _global_quats, global_positions = utils.quat_fk(anim.quats, anim.pos, anim.parents)
     return {
         "positions": global_positions / 100,
         "joint_names": anim.bones,

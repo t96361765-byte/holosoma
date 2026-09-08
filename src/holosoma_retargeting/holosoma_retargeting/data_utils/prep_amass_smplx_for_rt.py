@@ -125,7 +125,7 @@ def run_smplx_model(
     x_pred_smpl_verts = torch.cat(pred_verts, axis=0)
     x_pred_smpl_verts = x_pred_smpl_verts[cat_idx_map]  # (BS*T) X 6890 X 3
 
-    x_pred_smpl_joints = x_pred_smpl_joints.reshape(bs, num_steps, -1, 3)  # BS X T X 22 X 3/BS X T X 24 X 3
+    x_pred_smpl_joints = x_pred_smpl_joints.reshape(bs, num_steps, -1, 3)  # BS X T X 22 X 3
     x_pred_smpl_verts = x_pred_smpl_verts.reshape(bs, num_steps, -1, 3)  # BS X T X 6890 X 3
 
     mesh_faces = pred_body.f
@@ -134,31 +134,21 @@ def run_smplx_model(
 
 
 def prep_smplx_model(model_root_folder):
-    # Prepare SMPLX model
+    # G1 retargeting uses the neutral SMPL-X body model for all AMASS data.
     support_base_dir = model_root_folder
     surface_model_type = "smplx"
-    surface_model_male_fname = os.path.join(support_base_dir, surface_model_type, "SMPLX_MALE.npz")
-    surface_model_female_fname = os.path.join(support_base_dir, surface_model_type, "SMPLX_FEMALE.npz")
     surface_model_neutral_fname = os.path.join(support_base_dir, surface_model_type, "SMPLX_NEUTRAL.npz")
+    if not os.path.isfile(surface_model_neutral_fname):
+        raise FileNotFoundError(
+            "The AMASS preprocessing pipeline requires the neutral SMPL-X model at "
+            f"{surface_model_neutral_fname}"
+        )
+
     dmpl_fname = None
     num_dmpls = None
     num_expressions = None
     num_betas = 16
 
-    male_bm = BodyModel(
-        bm_fname=surface_model_male_fname,
-        num_betas=num_betas,
-        num_expressions=num_expressions,
-        num_dmpls=num_dmpls,
-        dmpl_fname=dmpl_fname,
-    )
-    female_bm = BodyModel(
-        bm_fname=surface_model_female_fname,
-        num_betas=num_betas,
-        num_expressions=num_expressions,
-        num_dmpls=num_dmpls,
-        dmpl_fname=dmpl_fname,
-    )
     neutral_bm = BodyModel(
         bm_fname=surface_model_neutral_fname,
         num_betas=num_betas,
@@ -167,10 +157,38 @@ def prep_smplx_model(model_root_folder):
         dmpl_fname=dmpl_fname,
     )
     return {
-        "male": male_bm,
-        "female": female_bm,
         "neutral": neutral_bm,
     }
+
+
+def resolve_model_root_folder(model_root_folder, input_npz_file):
+    """Find a model root containing smplx/SMPLX_NEUTRAL.npz."""
+    if model_root_folder is not None:
+        candidates = [Path(model_root_folder).expanduser()]
+    else:
+        candidates = []
+        env_model_root = os.environ.get("SMPLX_MODEL_ROOT")
+        if env_model_root:
+            candidates.append(Path(env_model_root).expanduser())
+
+        input_path = Path(input_npz_file).resolve()
+        candidates.extend(parent / "models" for parent in input_path.parents)
+
+    checked_paths = []
+    for candidate in candidates:
+        # Accept either the model root or the smplx directory itself.
+        model_root = candidate.parent if candidate.name.lower() == "smplx" else candidate
+        neutral_model = model_root / "smplx" / "SMPLX_NEUTRAL.npz"
+        checked_paths.append(str(neutral_model))
+        if neutral_model.is_file():
+            return str(model_root.resolve())
+
+    checked = "\n  ".join(checked_paths) if checked_paths else "<no candidate paths>"
+    raise FileNotFoundError(
+        "Could not find the neutral SMPL-X model. Expected SMPLX_NEUTRAL.npz at one of:\n"
+        f"  {checked}\n"
+        "Pass --model-root-folder or set the SMPLX_MODEL_ROOT environment variable."
+    )
 
 
 def compute_height(bm_dict, betas, gender):
@@ -223,12 +241,38 @@ def get_npz_files(amass_root_folder, subdataset_folder=None):
     else:
         # Load from amass_root_folder/**/*.npz (recursive)
         npz_files = [str(p) for p in amass_path.rglob("*_stageii.npz")]
-    return npz_files
+    return sorted(npz_files)
+
+
+def resolve_npz_files(input_file, amass_root_folder, subdataset_folder=None):
+    """Resolve either one explicit AMASS file or the existing batch selection."""
+    if input_file is None:
+        npz_files = get_npz_files(amass_root_folder, subdataset_folder)
+        if not npz_files:
+            raise FileNotFoundError(
+                f"No *_stageii.npz files found under AMASS root folder: {amass_root_folder}"
+            )
+        return npz_files
+
+    if subdataset_folder is not None:
+        raise ValueError("--input-file cannot be combined with --subdataset-folder")
+
+    input_path = Path(input_file).expanduser()
+    if not input_path.is_file():
+        raise FileNotFoundError(f"AMASS input file does not exist: {input_path}")
+    if input_path.suffix.lower() != ".npz":
+        raise ValueError(f"AMASS input file must be an .npz file: {input_path}")
+
+    return [str(input_path.resolve())]
 
 
 @dataclass
 class Config:
     """Configuration for processing AMASS SMPLX data."""
+
+    input_file: str | None = None
+    """Optional path to one AMASS SMPL-X .npz file. When set, only this file is
+    processed and amass_root_folder is ignored."""
 
     amass_root_folder: str = "/home/ubuntu/datasets/rt_ori_human_data/amass-smplx"
     """Root folder containing AMASS SMPLX npz files."""
@@ -236,8 +280,9 @@ class Config:
     output_folder: str = "/home/ubuntu/datasets/rt_processed_data/amass-smplx-processed"
     """Output folder for processed data."""
 
-    model_root_folder: str = "/home/ubuntu/datasets/rt_ori_human_data/smpl_all_models"
-    """Root folder containing SMPLX model files."""
+    model_root_folder: str | None = None
+    """Optional root folder containing smplx/SMPLX_NEUTRAL.npz. If omitted,
+    SMPLX_MODEL_ROOT and models folders above the AMASS input are searched."""
 
     subdataset_folder: str | None = None
     """Optional subdataset folder name. If specified, only loads npz files from
@@ -246,18 +291,26 @@ class Config:
 
 
 def main(cfg: Config):
-    # Get all the npz file paths in the amass-smplx folder
-    npz_file_paths = get_npz_files(cfg.amass_root_folder, cfg.subdataset_folder)
+    npz_file_paths = resolve_npz_files(cfg.input_file, cfg.amass_root_folder, cfg.subdataset_folder)
+    print(f"Selected {len(npz_file_paths)} AMASS file(s)")
+    if cfg.input_file is not None:
+        print(f"Input file: {npz_file_paths[0]}")
 
     # Prepare desired output folder
     os.makedirs(cfg.output_folder, exist_ok=True)
 
-    bm_dict = prep_smplx_model(cfg.model_root_folder)
+    model_root_folder = resolve_model_root_folder(cfg.model_root_folder, npz_file_paths[0])
+    print(f"SMPL-X model root: {model_root_folder}")
+    print("SMPL-X body model: neutral")
+    bm_dict = prep_smplx_model(model_root_folder)
 
     num_body_joints = 22
     for npz_file_path in npz_file_paths:
         data = load_ori_npz_file(npz_file_path)
-        gender = data["gender"]
+        source_gender = str(data["gender"])
+        gender = "neutral"
+        if source_gender != gender:
+            print(f"AMASS source gender '{source_gender}' will use the neutral SMPL-X model")
         betas = data["betas"]  # 16
         root_trans = data["trans"]  # T X 3
         aa_rot_rep = data["poses"]  # T X 165 (55*3)
@@ -275,7 +328,7 @@ def main(cfg: Config):
 
         global_joint_positions = (
             global_joint_positions.squeeze(0).detach().cpu().numpy()[:, :num_body_joints, :]
-        )  # T X 55 X 3
+        )
 
         # Compute height based on min_z and max_z value of all the vertices
         height = compute_height(bm_dict, betas, gender=[gender])

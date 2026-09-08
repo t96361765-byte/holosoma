@@ -20,6 +20,8 @@ def create_motion_control_sliders(
     viser_object: ViserUrdf | None = None,
     object_base_frame: viser.FrameHandle | None = None,
     contains_object_in_qpos: bool = True,
+    static_object_position: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    static_object_quaternion_wxyz: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0),
     initial_fps: int = 30,
     initial_interp_mult: int = 2,
     loop: bool = True,
@@ -43,6 +45,8 @@ def create_motion_control_sliders(
         viser_object: optional ViserUrdf for an object.
         object_base_frame: optional frame handle for the object root.
         contains_object_in_qpos: set True if motion_sequence includes the object 7D pose at the end.
+        static_object_position: object XYZ used when its pose is not stored in qpos.
+        static_object_quaternion_wxyz: object WXYZ used when its pose is not stored in qpos.
         initial_fps: base FPS for playback.
         initial_interp_mult: visual upsampling multiplier.
         loop: whether to wrap around at the end.
@@ -61,6 +65,16 @@ def create_motion_control_sliders(
         and contains_object_in_qpos
         and qpos.shape[1] >= (7 + robot_dof + 7)
     )
+    static_object_position_array = np.asarray(static_object_position, dtype=float)
+    static_object_quaternion = np.asarray(static_object_quaternion_wxyz, dtype=float)
+    if static_object_position_array.shape != (3,):
+        raise ValueError("static_object_position must contain XYZ")
+    if static_object_quaternion.shape != (4,):
+        raise ValueError("static_object_quaternion_wxyz must contain WXYZ")
+    quaternion_norm = float(np.linalg.norm(static_object_quaternion))
+    if quaternion_norm < 1e-12:
+        raise ValueError("static_object_quaternion_wxyz must be non-zero")
+    static_object_quaternion /= quaternion_norm
 
     # ---------------- GUI ----------------
     with server.gui.add_folder("Playback"):
@@ -149,9 +163,8 @@ def create_motion_control_sliders(
             prev["obj_q"] = o_q
             object_base_frame.wxyz = o_q
         elif object_base_frame is not None and viser_object is not None:
-            # fallback static pose
-            object_base_frame.position = np.zeros(3)
-            object_base_frame.wxyz = np.array([1.0, 0.0, 0.0, 0.0])
+            object_base_frame.position = static_object_position_array
+            object_base_frame.wxyz = static_object_quaternion
 
     def _apply_discrete_frame(i: int) -> None:
         i = int(np.clip(i, 0, n_frames - 1))
@@ -227,6 +240,7 @@ def create_motion_control_sliders(
             else:
                 time.sleep(0.02)
 
+    _apply_discrete_frame(0)
     threading.Thread(target=_player_loop, daemon=True).start()
 
     # initial draw

@@ -10,22 +10,38 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal
 
 import numpy as np
+import trimesh
 import tyro
 
 src_root = Path(__file__).resolve().parents[2]
 if str(src_root) not in sys.path:
     sys.path.insert(0, str(src_root))
 
+PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+MODELS_ROOT = PACKAGE_ROOT / "models"
+
 from holosoma_retargeting.config_types.data_type import DEMO_JOINTS_REGISTRY, MotionDataConfig  # noqa: E402
 from holosoma_retargeting.config_types.retargeter import RetargeterConfig  # noqa: E402
 from holosoma_retargeting.config_types.retargeting import RetargetingConfig  # noqa: E402
 from holosoma_retargeting.config_types.robot import RobotConfig  # noqa: E402
 from holosoma_retargeting.config_types.task import TaskConfig  # noqa: E402
+from holosoma_retargeting.data_utils.nokov_bvh import extract_nokov_global_positions  # noqa: E402
+from holosoma_retargeting.data_utils.nokov_fixed_object import (  # noqa: E402
+    create_static_mesh_scene,
+    create_static_mesh_urdf,
+    create_upper_surface_collision_mesh,
+    ground_and_recenter_static_pose,
+    level_static_pose,
+    load_static_nokov_pose,
+    translate_human_joints,
+)
+from holosoma_retargeting.data_utils.pommel_bvh import extract_pommel_global_positions  # noqa: E402
 from holosoma_retargeting.src.interaction_mesh_retargeter import (  # noqa: E402
     InteractionMeshRetargeter,  # type: ignore[import-not-found]
 )
@@ -42,6 +58,7 @@ from holosoma_retargeting.src.utils import (  # noqa: E402
     load_object_data,
     preprocess_motion_data,
     transform_from_human_to_world,
+    transform_points_world_to_local,
     transform_y_up_to_z_up,
 )
 
@@ -124,8 +141,21 @@ def create_task_constants(
         task_constants.OBJECT_NAME = obj_name
         object_dir = task_config.object_dir
         task_constants.OBJECT_DIR = str(object_dir) if object_dir else ""
-        task_constants.OBJECT_URDF_FILE = str(object_dir / f"{obj_name}.urdf") if object_dir else f"{obj_name}.urdf"
-        task_constants.OBJECT_MESH_FILE = str(object_dir / f"{obj_name}.obj") if object_dir else f"{obj_name}.obj"
+        task_constants.FIXED_OBJECT = task_config.object_mesh is not None
+        task_constants.OBJECT_URDF_FILE = (
+            str((MODELS_ROOT / obj_name / f"{obj_name}_static.urdf").resolve())
+            if task_constants.FIXED_OBJECT
+            else str(object_dir / f"{obj_name}.urdf")
+            if object_dir
+            else f"{obj_name}.urdf"
+        )
+        task_constants.OBJECT_MESH_FILE = (
+            str(task_config.object_mesh)
+            if task_config.object_mesh is not None
+            else str(object_dir / f"{obj_name}.obj")
+            if object_dir
+            else f"{obj_name}.obj"
+        )
         task_constants.SCENE_XML_FILE = ""  # Will be set later
 
     return task_constants
@@ -150,8 +180,8 @@ def validate_config(cfg: RetargetingConfig) -> None:
         )
 
     # Task-specific format requirements
-    if cfg.task_type == "climbing" and cfg.data_format not in (None, "mocap"):
-        raise ValueError("Climbing task requires 'mocap' data format")
+    if cfg.task_type == "climbing" and cfg.data_format not in (None, "mocap", "nokov", "pommel"):
+        raise ValueError("Climbing task requires 'mocap', 'nokov', or 'pommel' data format")
     if cfg.task_type == "object_interaction" and cfg.data_format not in (None, "smplh"):
         raise ValueError("Object interaction requires 'smplh' data format")
     # robot_only accepts any format in the registry (already validated above)
@@ -174,6 +204,172 @@ def create_ground_points(x_range: tuple[float, float], y_range: tuple[float, flo
     return np.stack([X.flatten(), Y.flatten(), np.zeros_like(X.flatten())], axis=1)
 
 
+def sample_fixed_object_contact_points(
+    mesh_file: str | Path,
+    sample_count: int,
+    task_config: TaskConfig,
+) -> tuple[np.ndarray, dict[str, float | int]]:
+    """Sample the complete upper support cap uniformly by triangle area."""
+    if sample_count < 4:
+        raise ValueError("fixed_object_sample_count must be at least 4")
+
+    if not 0 < task_config.fixed_object_upper_height_fraction < 1:
+        raise ValueError("fixed_object_upper_height_fraction must be between 0 and 1")
+    if not 0 < task_config.fixed_object_upper_interior_radius <= 1:
+        raise ValueError("fixed_object_upper_interior_radius must be in (0, 1]")
+    if not -1 <= task_config.fixed_object_upper_normal_z <= 1:
+        raise ValueError("fixed_object_upper_normal_z must be between -1 and 1")
+
+    mesh = trimesh.load(mesh_file, force="mesh", process=False)
+    if not isinstance(mesh, trimesh.Trimesh) or len(mesh.faces) == 0:
+        raise ValueError(f"Object asset is not a non-empty triangle mesh: {mesh_file}")
+
+    face_centers = mesh.triangles_center
+    bounds = mesh.bounds
+    height_span = bounds[1, 2] - bounds[0, 2]
+    xy_half_extent = (bounds[1, :2] - bounds[0, :2]) / 2.0
+    if height_span <= 0 or np.any(xy_half_extent <= 0):
+        raise ValueError(f"Object mesh has degenerate bounds: {mesh_file}")
+
+    normalized_height = (face_centers[:, 2] - bounds[0, 2]) / height_span
+    xy_center = (bounds[0, :2] + bounds[1, :2]) / 2.0
+    normalized_radius = np.linalg.norm((face_centers[:, :2] - xy_center) / xy_half_extent, axis=1)
+    upper_surface = (
+        (normalized_height >= task_config.fixed_object_upper_height_fraction)
+        & (mesh.face_normals[:, 2] >= task_config.fixed_object_upper_normal_z)
+        & (normalized_radius <= task_config.fixed_object_upper_interior_radius)
+    )
+    if not np.any(upper_surface):
+        raise ValueError("No faces satisfy the fixed-object upper-surface filters")
+    points, _ = trimesh.sample.sample_surface(
+        mesh,
+        sample_count,
+        face_weight=upper_surface.astype(float),
+        seed=task_config.fixed_object_sampling_seed,
+    )
+
+    face_areas = mesh.area_faces
+    total_area = float(face_areas.sum())
+    stats: dict[str, float | int] = {
+        "upper_count": sample_count,
+        "upper_face_count": int(np.count_nonzero(upper_surface)),
+        "upper_area_fraction": float(face_areas[upper_surface].sum() / total_area),
+    }
+    return points, stats
+
+
+def _resolve_nokov_capture_dir(data_path: Path, task_name: str) -> Path:
+    """Accept either the NOKOV root folder or the sequence folder itself."""
+    nested = data_path / task_name
+    if (nested / f"{task_name}-Bodylt.bvh").is_file():
+        return nested
+    if (data_path / f"{task_name}-Bodylt.bvh").is_file():
+        return data_path
+    return nested
+
+
+def align_fixed_nokov_capture(
+    human_joints: np.ndarray,
+    data_path: Path,
+    task_name: str,
+    task_config: TaskConfig,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Ground/recenter a static mesh and apply the same translation to the human."""
+    if task_config.object_mesh is None:
+        raise ValueError("NOKOV fixed-object climbing requires --task-config.object-mesh")
+    if task_config.object_scale <= 0:
+        raise ValueError("task_config.object_scale must be positive")
+
+    capture_dir = _resolve_nokov_capture_dir(data_path, task_name)
+    object_pose_file = task_config.object_pose_file or capture_dir / f"{task_name}-mushroom.csv"
+    raw_pose, pose_sample_count = load_static_nokov_pose(object_pose_file)
+    leveled_pose = level_static_pose(raw_pose)
+    mesh = trimesh.load(task_config.object_mesh, force="mesh", process=False)
+    if not isinstance(mesh, trimesh.Trimesh) or len(mesh.vertices) == 0:
+        raise ValueError(f"Object asset is not a non-empty triangle mesh: {task_config.object_mesh}")
+    placed_pose, world_shift = ground_and_recenter_static_pose(
+        leveled_pose,
+        mesh,
+        scale=task_config.object_scale,
+    )
+    aligned_human = translate_human_joints(human_joints, world_shift)
+    object_poses = np.tile(placed_pose, (len(aligned_human), 1))
+    logger.info(
+        "Aligned fixed NOKOV object from %s (%d samples): xy=(0, 0), base z=0, human shift=%s m",
+        object_pose_file,
+        pose_sample_count,
+        np.array2string(world_shift, precision=7),
+    )
+    return aligned_human, object_poses, world_shift
+
+
+def align_fixed_pommel_capture(
+    human_joints: np.ndarray,
+    task_config: TaskConfig,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Apply the Blender mushroom reference while preserving human registration."""
+
+    if task_config.object_mesh is None:
+        raise ValueError("Pommel fixed-object climbing requires --task-config.object-mesh")
+    if task_config.object_scale <= 0:
+        raise ValueError("task_config.object_scale must be positive")
+    if not np.isfinite(task_config.pommel_z_compression) or task_config.pommel_z_compression <= 0:
+        raise ValueError("pommel_z_compression must be positive and finite")
+    pommel_scale_xyz = np.array(
+        [
+            task_config.object_scale,
+            task_config.object_scale,
+            task_config.object_scale / task_config.pommel_z_compression,
+        ],
+        dtype=float,
+    )
+    position = np.asarray(task_config.pommel_reference_position, dtype=float)
+    quaternion = np.asarray(task_config.pommel_reference_quaternion, dtype=float)
+    if position.shape != (3,) or not np.all(np.isfinite(position)):
+        raise ValueError("pommel_reference_position must contain three finite XYZ values")
+    if quaternion.shape != (4,) or not np.all(np.isfinite(quaternion)):
+        raise ValueError("pommel_reference_quaternion must contain four finite WXYZ values")
+    quaternion_norm = np.linalg.norm(quaternion)
+    if quaternion_norm < 1e-8:
+        raise ValueError("pommel_reference_quaternion must be non-zero")
+    quaternion /= quaternion_norm
+
+    mesh = trimesh.load(task_config.object_mesh, force="mesh", process=False)
+    if not isinstance(mesh, trimesh.Trimesh) or len(mesh.vertices) == 0:
+        raise ValueError(f"Object asset is not a non-empty triangle mesh: {task_config.object_mesh}")
+    reference_pose = np.concatenate((quaternion, position))
+    placed_pose, world_shift = ground_and_recenter_static_pose(
+        reference_pose,
+        mesh,
+        scale=pommel_scale_xyz,
+    )
+    aligned_human = translate_human_joints(human_joints, world_shift)
+    radial_offset = float(task_config.pommel_human_radial_offset)
+    if not np.isfinite(radial_offset):
+        raise ValueError("pommel_human_radial_offset must be finite")
+    radial_shift = np.zeros(3, dtype=float)
+    if radial_offset != 0.0:
+        initial_hips_xy = aligned_human[0, 0, :2]
+        horizontal_distance = float(np.linalg.norm(initial_hips_xy))
+        if horizontal_distance < 1e-8:
+            raise ValueError(
+                "Cannot infer the outward pommel direction because the first-frame "
+                "Hips XY position is at the mushroom axis"
+            )
+        radial_shift[:2] = radial_offset * initial_hips_xy / horizontal_distance
+        aligned_human = translate_human_joints(aligned_human, radial_shift)
+    object_poses = np.tile(placed_pose, (len(aligned_human), 1))
+    logger.info(
+        "Aligned Blender pommel reference: source xyz=%s -> axis xy=(0, 0), base z=0, "
+        "origin z=%.7f m, shared human/object shift=%s m, human radial shift=%s m",
+        np.array2string(position, precision=7),
+        placed_pose[6],
+        np.array2string(world_shift, precision=7),
+        np.array2string(radial_shift, precision=7),
+    )
+    return aligned_human, object_poses
+
+
 def load_motion_data(
     task_type: TaskType,
     data_format: str,
@@ -186,7 +382,7 @@ def load_motion_data(
 
     Args:
         task_type: Type of task
-        data_format: Data format ("lafan", "smplh", "mocap")
+        data_format: Data format ("lafan", "smplh", "mocap", "nokov", "pommel")
         data_path: Path to data directory
         task_name: Name of the task/sequence
         constants: Task constants
@@ -232,6 +428,41 @@ def load_motion_data(
 
             default_human_height = motion_data_config.default_human_height or 1.78
             smpl_scale = constants.ROBOT_HEIGHT / default_human_height
+        elif data_format == "nokov":
+            bvh_candidates = [
+                data_path / f"{task_name}-Bodylt.bvh",
+                data_path / f"{task_name}.bvh",
+            ]
+            bvh_file = data_path if data_path.is_file() else next((path for path in bvh_candidates if path.is_file()), None)
+            if bvh_file is None:
+                expected = " or ".join(str(path) for path in bvh_candidates)
+                raise FileNotFoundError(f"NOKOV Body BVH not found; expected {expected}")
+
+            parsed = extract_nokov_global_positions(bvh_file, z_up=True, target_fps=30.0)
+            human_joints = np.asarray(parsed["positions"])
+            logger.info(
+                "Parsed robot-only NOKOV BVH: %d frames at %.6g Hz -> %d frames at 30 Hz",
+                parsed["num_source_frames"],
+                parsed["source_fps"],
+                parsed["num_frames"],
+            )
+            smpl_scale = motion_data_config.default_scale_factor or 1.0
+        elif data_format == "pommel":
+            bvh_file = data_path if data_path.is_file() else data_path / f"{task_name}.bvh"
+            if not bvh_file.is_file():
+                raise FileNotFoundError(f"Pommel BVH not found: {bvh_file}")
+
+            parsed = extract_pommel_global_positions(bvh_file, target_fps=30.0)
+            human_joints = np.asarray(parsed["positions"])
+            logger.info(
+                "Parsed robot-only pommel BVH without axis swapping: %d frames at %.6g Hz -> "
+                "%d frames at 30 Hz (%s)",
+                parsed["num_source_frames"],
+                parsed["source_fps"],
+                parsed["num_frames"],
+                parsed["source_axes"],
+            )
+            smpl_scale = motion_data_config.default_scale_factor or 1.0
         elif data_format == "smplx":
             npz_file = data_path / f"{task_name}.npz"
 
@@ -262,19 +493,46 @@ def load_motion_data(
         smpl_scale = calculate_scale_factor(task_name, constants.ROBOT_HEIGHT)
 
     elif task_type == "climbing":
-        task_dir = data_path / task_name
-        npy_files = list(task_dir.glob("*.npy"))
-        if not npy_files:
-            raise FileNotFoundError(f"No .npy file found in {task_dir}")
-
-        npy_file = npy_files[0]
-        # MOCAP-specific downsample factor
-        downsample = 4
-        human_joints = np.load(str(npy_file))[::downsample]
+        task_dir = _resolve_nokov_capture_dir(data_path, task_name) if data_format == "nokov" else data_path / task_name
+        if data_format == "pommel":
+            bvh_file = data_path if data_path.is_file() else data_path / f"{task_name}.bvh"
+            if not bvh_file.is_file():
+                raise FileNotFoundError(f"Pommel BVH not found: {bvh_file}")
+            parsed = extract_pommel_global_positions(bvh_file, target_fps=30.0)
+            human_joints = np.asarray(parsed["positions"])
+            logger.info(
+                "Parsed fixed-object pommel BVH without axis swapping: %d frames at %.6g Hz -> "
+                "%d frames at 30 Hz (%s)",
+                parsed["num_source_frames"],
+                parsed["source_fps"],
+                parsed["num_frames"],
+                parsed["source_axes"],
+            )
+            smpl_scale = motion_data_config.default_scale_factor or 1.0
+        elif data_format == "nokov":
+            preferred_bvh = task_dir / f"{task_name}-Bodylt.bvh"
+            bvh_files = [preferred_bvh] if preferred_bvh.is_file() else sorted(task_dir.glob("*-Bodylt.bvh"))
+            if len(bvh_files) != 1:
+                raise FileNotFoundError(f"Expected one NOKOV *-Bodylt.bvh file in {task_dir}, found {len(bvh_files)}")
+            parsed = extract_nokov_global_positions(bvh_files[0], z_up=True, target_fps=30.0)
+            human_joints = np.asarray(parsed["positions"])
+            logger.info(
+                "Parsed NOKOV BVH: %d frames at %.6g Hz -> %d frames at 30 Hz",
+                parsed["num_source_frames"],
+                parsed["source_fps"],
+                parsed["num_frames"],
+            )
+            smpl_scale = motion_data_config.default_scale_factor or 1.0
+        else:
+            npy_files = list(task_dir.glob("*.npy"))
+            if not npy_files:
+                raise FileNotFoundError(f"No .npy file found in {task_dir}")
+            # MOCAP-specific downsample factor
+            human_joints = np.load(str(npy_files[0]))[::4]
+            default_human_height = motion_data_config.default_human_height or 1.78
+            smpl_scale = constants.ROBOT_HEIGHT / default_human_height
         num_frames = human_joints.shape[0]
         object_poses = np.tile(np.array([[1, 0, 0, 0, 0, 0, 0]]), (num_frames, 1))
-        default_human_height = motion_data_config.default_human_height or 1.78
-        smpl_scale = constants.ROBOT_HEIGHT / default_human_height
 
     logger.debug(
         "Loaded %d frames, scale factor: %.4f",
@@ -291,7 +549,9 @@ def setup_object_data(
     smpl_scale: float,
     task_config: TaskConfig,
     augmentation: bool,
+    object_poses: np.ndarray | None = None,
     object_scale_augmented: np.ndarray | None = None,
+    human_joints: np.ndarray | None = None,
 ) -> tuple[np.ndarray | None, np.ndarray | None, str | None]:
     """Setup object-specific data (ground, object mesh, climbing terrain).
     Args:
@@ -328,6 +588,107 @@ def setup_object_data(
     if task_type == "climbing":
         if object_dir is None:
             raise ValueError("object_dir must be provided for climbing task")
+
+        if getattr(constants, "FIXED_OBJECT", False):
+            if object_poses is None:
+                raise ValueError("Fixed-object climbing requires a synchronized object pose")
+
+            object_dir.mkdir(parents=True, exist_ok=True)
+            target_pose = np.asarray(object_poses[0], dtype=float)
+            if not np.isfinite(task_config.pommel_z_compression) or task_config.pommel_z_compression <= 0:
+                raise ValueError("pommel_z_compression must be positive and finite")
+            fixed_object_scale_xyz = np.array(
+                [
+                    task_config.object_scale,
+                    task_config.object_scale,
+                    task_config.object_scale / task_config.pommel_z_compression,
+                ],
+                dtype=float,
+            )
+            if task_config.fixed_object_surface_points_enabled:
+                target_object_points, sampling_stats = sample_fixed_object_contact_points(
+                    constants.OBJECT_MESH_FILE,
+                    task_config.fixed_object_sample_count,
+                    task_config,
+                )
+                target_object_points *= fixed_object_scale_xyz
+                logger.info(
+                    "Uniform fixed-object upper-cap sampling: %d points over %d faces "
+                    "(%.1f%% of mesh area)",
+                    sampling_stats["upper_count"],
+                    sampling_stats["upper_face_count"],
+                    100 * sampling_stats["upper_area_fraction"],
+                )
+            else:
+                target_object_points = np.empty((0, 3), dtype=float)
+                logger.info(
+                    "Fixed object is collision-only: no surface points are included in "
+                    "the interaction mesh"
+                )
+            fixed_object_surface_point_count = len(target_object_points)
+
+            ground_nx, ground_ny = task_config.fixed_object_ground_shape
+            ground_min, ground_max = task_config.fixed_object_ground_range
+            if ground_nx < 2 or ground_ny < 2:
+                raise ValueError("fixed_object_ground_shape values must both be at least 2")
+            if ground_min >= ground_max:
+                raise ValueError("fixed_object_ground_range must be ordered low to high")
+
+            ground_x, ground_y = np.meshgrid(
+                np.linspace(ground_min, ground_max, ground_nx),
+                np.linspace(ground_min, ground_max, ground_ny),
+                indexing="xy",
+            )
+            ground_points_world = np.column_stack(
+                (ground_x.ravel(), ground_y.ravel(), np.zeros(ground_x.size))
+            )
+            ground_points_local = transform_points_world_to_local(
+                target_pose[:4], target_pose[4:7], ground_points_world
+            )
+            target_object_points = np.vstack((target_object_points, ground_points_local))
+            demo_object_points = target_object_points * smpl_scale
+            logger.info(
+                "Fixed-object interaction points: %d object surface + %d ground grid "
+                "(%d x %d over [%.3f, %.3f] m in world XY)",
+                fixed_object_surface_point_count,
+                len(ground_points_local),
+                ground_nx,
+                ground_ny,
+                ground_min,
+                ground_max,
+            )
+
+            robot_xml = Path(constants.ROBOT_URDF_FILE).with_suffix(".xml").resolve()
+            scene_xml = object_dir / f"{Path(constants.ROBOT_URDF_FILE).stem}_w_{constants.OBJECT_NAME}.xml"
+            object_urdf = Path(constants.OBJECT_URDF_FILE)
+            upper_collision_mesh = create_upper_surface_collision_mesh(
+                Path(constants.OBJECT_MESH_FILE),
+                object_dir / f"{constants.OBJECT_NAME}_upper_collision.obj",
+                height_fraction=task_config.fixed_object_upper_height_fraction,
+                normal_z=task_config.fixed_object_upper_normal_z,
+                interior_radius=task_config.fixed_object_upper_interior_radius,
+            )
+            create_static_mesh_scene(
+                robot_xml,
+                Path(constants.OBJECT_MESH_FILE),
+                scene_xml,
+                target_pose,
+                scale=fixed_object_scale_xyz,
+                object_name=constants.OBJECT_NAME,
+                collision_mesh=upper_collision_mesh,
+            )
+            create_static_mesh_urdf(
+                Path(constants.OBJECT_MESH_FILE),
+                object_urdf,
+                scale=fixed_object_scale_xyz,
+                object_name=constants.OBJECT_NAME,
+            )
+            constants.SCENE_XML_FILE = str(scene_xml.resolve())
+            constants.STATIC_OBJECT_POSITION = target_pose[4:7].copy()
+            constants.STATIC_OBJECT_QUAT = target_pose[:4].copy()
+            constants.FIXED_OBJECT_TARGET_POSE = target_pose.copy()
+            logger.info("Generated fixed-object retargeting scene: %s", scene_xml)
+            return target_object_points, demo_object_points, str(object_urdf.resolve())
 
         # Setup climbing-specific object
         box_asset_xml = object_dir / "box_assets.xml"
@@ -394,8 +755,9 @@ def _compute_q_init_base(
         q_init_base in MuJoCo order: [0:3] position, [3:7] quaternion, [7:] joints
     """
     if task_type == "robot_only":
-        if data_format == "lafan":
-            spine_joint_idx = constants.DEMO_JOINTS.index("Spine1")
+        if data_format in ("lafan", "nokov", "pommel"):
+            root_tracking_joint = "Chest2" if data_format == "pommel" else "Spine1"
+            spine_joint_idx = constants.DEMO_JOINTS.index(root_tracking_joint)
             human_quat_init = estimate_human_orientation(human_joints, constants.DEMO_JOINTS)
             # MuJoCo order: pos first, then quat
             q_init_base = np.concatenate(
@@ -419,7 +781,8 @@ def _compute_q_init_base(
         _, human_quat_init = transform_from_human_to_world(
             human_joints[0, 0, :], object_poses[0], np.array([0.0, 0.0, 0.0])
         )
-        spine_joint_idx = retargeter.demo_joints.index("Spine1")
+        root_tracking_joint = "Chest2" if data_format == "pommel" else "Spine1"
+        spine_joint_idx = retargeter.demo_joints.index(root_tracking_joint)
         # MuJoCo order: pos first, then quat
         q_init_base = np.concatenate(
             [
@@ -468,7 +831,18 @@ def build_retargeter_kwargs_from_config(
         "activate_joint_limits": retargeter_config.activate_joint_limits,
         "activate_obj_non_penetration": retargeter_config.activate_obj_non_penetration,
         "activate_foot_sticking": retargeter_config.activate_foot_sticking,
+        "activate_foot_support_z": (
+            retargeter_config.activate_foot_support_z
+            and task_type == "climbing"
+            and getattr(constants, "FIXED_OBJECT", False)
+        ),
+        "foot_support_ground_height": retargeter_config.foot_support_ground_height,
+        "foot_support_z_soft_weight": retargeter_config.foot_support_z_soft_weight,
+        "foot_support_z_hard_tolerance": retargeter_config.foot_support_z_hard_tolerance,
         "foot_lock": retargeter_config.foot_lock,
+        "hand_sticking": retargeter_config.hand_sticking,
+        "hand_tracking_point_offset": retargeter_config.hand_tracking_point_offset,
+        "arm_straightness": retargeter_config.arm_straightness,
         "penetration_tolerance": retargeter_config.penetration_tolerance,
         "foot_sticking_tolerance": retargeter_config.foot_sticking_tolerance,
         "self_collision": retargeter_config.self_collision,
@@ -554,6 +928,15 @@ def initialize_robot_pose(
         return q_init, None, object_poses_augmented, human_joints, object_poses
 
     if task_type == "climbing":
+        if getattr(constants, "FIXED_OBJECT", False):
+            if augmentation:
+                raise ValueError("Augmentation is not supported for fixed NOKOV objects")
+            q_init = _compute_q_init_base(task_type, data_format, human_joints, object_poses, constants, retargeter)
+            target_pose = np.asarray(constants.FIXED_OBJECT_TARGET_POSE, dtype=float)
+            object_poses_augmented = np.tile(target_pose, (len(object_poses), 1))
+            object_poses = convert_object_poses_to_mujoco_order(object_poses)
+            object_poses_augmented = convert_object_poses_to_mujoco_order(object_poses_augmented)
+            return q_init, None, object_poses_augmented, human_joints, object_poses
         if augmentation:
             original_path = save_dir / f"{task_name}_original.npz"
             if not original_path.exists():
@@ -621,15 +1004,39 @@ def main(cfg: RetargetingConfig) -> None:
 
     # Ensure configs match top-level selections
     if cfg.robot_config.robot_type != robot:
-        cfg.robot_config = RobotConfig(robot_type=robot)
+        cfg.robot_config = replace(cfg.robot_config, robot_type=robot)
 
     if cfg.motion_data_config.robot_type != robot or cfg.motion_data_config.data_format != data_format:
-        cfg.motion_data_config = MotionDataConfig(data_format=data_format, robot_type=robot)
+        cfg.motion_data_config = replace(cfg.motion_data_config, data_format=data_format, robot_type=robot)
 
-    # Task-specific object setup: set default object_dir for climbing if not provided
-    if task_type == "climbing" and cfg.task_config.object_dir is None:
-        from dataclasses import replace
+    if robot == "r1":
+        hands = cfg.retargeter.hand_sticking
+        if hands.robot_link_names == ("left_rubber_hand_link", "right_rubber_hand_link"):
+            hands = replace(hands, robot_link_names=("left_wrist_roll_link", "right_wrist_roll_link"),
+                            point_offset=(0.0, 0.0, 0.0))
+        if data_format == "nokov" and hands.demo_joint_names == ("L_Wrist", "R_Wrist"):
+            hands = replace(hands, demo_joint_names=("LeftHand", "RightHand"))
+        if data_format == "pommel" and hands.demo_joint_names == ("L_Wrist", "R_Wrist"):
+            hands = replace(hands, demo_joint_names=("LeftWrist", "RightWrist"))
+        cfg.retargeter = replace(cfg.retargeter, hand_sticking=hands)
 
+    # Fixed pommel/NOKOV tasks use the reusable in-package mushroom asset. Pose-specific MuJoCo
+    # scenes live in the model cache, so save_dir contains only final NPZ files.
+    if task_type == "climbing" and data_format in ("nokov", "pommel"):
+        object_name = cfg.task_config.object_name or "mushroom"
+        object_model_dir = MODELS_ROOT / object_name
+        cfg.task_config = replace(
+            cfg.task_config,
+            object_name=object_name,
+            object_mesh=cfg.task_config.object_mesh or object_model_dir / "mushroom_visual.obj",
+            object_dir=object_model_dir / "generated_scenes" / task_name,
+            object_scale=(
+                cfg.task_config.pommel_reference_scale
+                if data_format == "pommel"
+                else cfg.task_config.object_scale
+            ),
+        )
+    elif task_type == "climbing" and cfg.task_config.object_dir is None:
         cfg.task_config = replace(cfg.task_config, object_dir=data_path / task_name)
 
     constants = create_task_constants(
@@ -643,6 +1050,15 @@ def main(cfg: RetargetingConfig) -> None:
     human_joints, object_poses, smpl_scale = load_motion_data(
         task_type, data_format, data_path, task_name, constants, cfg.motion_data_config
     )
+    if task_type == "climbing" and data_format == "nokov":
+        human_joints, object_poses, _ = align_fixed_nokov_capture(
+            human_joints,
+            data_path,
+            task_name,
+            cfg.task_config,
+        )
+    elif task_type == "climbing" and data_format == "pommel":
+        human_joints, object_poses = align_fixed_pommel_capture(human_joints, cfg.task_config)
 
     # Get toe names from motion data config (depends only on data_format)
     toe_names = cfg.motion_data_config.toe_names
@@ -655,7 +1071,9 @@ def main(cfg: RetargetingConfig) -> None:
         smpl_scale,
         cfg.task_config,
         cfg.augmentation,
+        object_poses=object_poses,
         object_scale_augmented=_OBJECT_SCALE_AUGMENTED,
+        human_joints=human_joints,
     )
 
     # Create retargeter
@@ -666,6 +1084,12 @@ def main(cfg: RetargetingConfig) -> None:
     # Preprocess motion data
     if task_type == "robot_only":
         human_joints = preprocess_motion_data(human_joints, retargeter, toe_names, smpl_scale)
+    elif task_type == "climbing" and getattr(constants, "FIXED_OBJECT", False):
+        # Build the source interaction graph at the robot/human scale while
+        # keeping the target mushroom at its physical scale in the static scene.
+        human_joints = human_joints * smpl_scale
+        object_poses = object_poses.copy()
+        object_poses[:, 4:7] *= smpl_scale
     elif task_type in {"object_interaction", "climbing"}:
         human_joints, object_poses, object_moving_frame_idx = preprocess_motion_data(
             human_joints,
@@ -691,7 +1115,37 @@ def main(cfg: RetargetingConfig) -> None:
     )
 
     # Extract foot sticking sequences
-    foot_sticking_sequences = extract_foot_sticking_sequence_velocity(human_joints, retargeter.demo_joints, toe_names)
+    fixed_object_foot_support = (
+        task_type == "climbing"
+        and getattr(constants, "FIXED_OBJECT", False)
+        and cfg.retargeter.activate_foot_support_z
+    )
+    foot_sticking_sequences = extract_foot_sticking_sequence_velocity(
+        human_joints,
+        retargeter.demo_joints,
+        toe_names,
+        velocity_threshold=cfg.retargeter.foot_contact_velocity_threshold,
+        height_threshold=(
+            cfg.retargeter.foot_contact_height_threshold if fixed_object_foot_support else None
+        ),
+        ground_height=cfg.retargeter.foot_support_ground_height,
+    )
+    if fixed_object_foot_support:
+        # The detector consumes source-joint names such as LeftToeBase, but its
+        # output uses canonical contact keys (currently L_Toe and R_Toe).
+        # Count the returned keys instead of indexing with the input names.
+        contact_keys = tuple(foot_sticking_sequences[0])
+        support_counts = {
+            contact_key: sum(frame[contact_key] for frame in foot_sticking_sequences)
+            for contact_key in contact_keys
+        }
+        logger.info(
+            "Fixed-object foot support frames (XY speed <= %.4f m/frame, Z <= %.3f m): %s",
+            cfg.retargeter.foot_contact_velocity_threshold,
+            cfg.retargeter.foot_support_ground_height
+            + cfg.retargeter.foot_contact_height_threshold,
+            support_counts,
+        )
 
     # Task-specific foot sticking adjustments
     if task_type == "object_interaction":

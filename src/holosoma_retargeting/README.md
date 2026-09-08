@@ -16,7 +16,6 @@ python examples/robot_retarget.py --data_path demo_data/OMOMO_new --task-type ob
 # Climbing
 python examples/robot_retarget.py --data_path demo_data/climb --task-type climbing --task-name mocap_climb_seq_0 --data_format mocap --robot-config.robot-urdf-file models/g1/g1_29dof_spherehand.urdf --retargeter.debug --retargeter.visualize
 ```
-
 **Note**: Add `--augmentation` to run sequences with augmentation. You must first run the original sequence before adding augmentation.
 
 ## Batch Processing for Motion Retargeting
@@ -115,7 +114,7 @@ python prep_amass_smplx_for_rt.py \
   --model-root-folder /path/to/models
 ```
 
-This will convert the AMASS `.npz` files to `.npz` format with global joint positions and height information.
+This converts each AMASS sequence into an `.npz` containing 22 global body joint positions and subject height.
 
 **Note**: You can optionally specify `--subdataset-folder` to process only a specific subdataset (e.g., `HumanEva`). If not specified, it will process all datasets recursively.
 
@@ -223,3 +222,217 @@ Please see the instructions for custom human motion data formats: [ADD_MOTION_FO
 
 ## Custom Robot Type
 Please see the instructions for retargeting custom robot types: [ADD_ROBOT_TYPE_README.md](ADD_ROBOT_TYPE_README.md)
+
+
+
+
+## AMASS G1 *OmniRetarget*
+
+### Prepare AMASS SMPL-X for OmniRetarget
+
+Input: AMASS-120Hz, Output: KeyPoints-30Hz
+
+```powershell
+cd D:\GitHub\holosoma\src\holosoma_retargeting\holosoma_retargeting\data_utils
+& D:\anaconda3\envs\omniretarget\python.exe `
+  .\prep_amass_smplx_for_rt.py `
+  --input-file "D:\track_dataset\CMU_dataset\85\85_10_stageii.npz" `
+  --output-folder "D:\track_dataset\omniretarget_processed"
+```
+
+### AMASS CMU retargeting
+
+Remember to choose differents kinds of constraints:
+
+```powershell
+cd D:\GitHub\holosoma\src\holosoma_retargeting\holosoma_retargeting
+& D:\anaconda3\envs\omniretarget\python.exe `
+  .\examples\robot_retarget.py `
+  --data-path "D:\track_dataset\omniretarget_processed" `
+  --task-type robot_only `
+  --task-name "CMU_dataset_90_90_29_stageii" `
+  --data-format smplx `
+  --robot g1 `
+  --robot-config.robot-urdf-file "models/g1_29dof_fist_pan/g1_29dof_fist_pan.urdf" `
+  --save-dir "D:\track_dataset\omniretarget_results" `
+  --task-config.ground-range -1.8 1.8 `
+  --task-config.ground-size 23 `
+  --retargeter.hand-sticking.enable `
+  --retargeter.arm-straightness.enable `
+  --retargeter.arm-straightness.weight 2.5
+```
+
+### Play AMASS G1 with Viser
+
+CMU-85: 01/flip 02/flip 05/handstand 06/webster 08/thomas 13/handstand 14/dance(Hard)
+CMU-88: 06/flykick 08/handstand 09/handstand
+CMU-90: 06/flykick 08/cartwheel 19/flip 29/dance(Hard) 30/Russian
+
+```powershell
+cd D:\GitHub\holosoma\src\holosoma_retargeting\holosoma_retargeting
+& D:\anaconda3\envs\omniretarget\python.exe `
+  .\viser_player.py `
+  --robot-urdf ".\models\g1_29dof_fist_pan\g1_29dof_fist_pan.urdf" `
+  --qpos-npz "D:\track_dataset\omniretarget_results\CMU_dataset_90_90_29_stageii.npz" `
+  --no-assume-object-in-qpos `
+  --loop
+```
+
+## NOKOV G1-Mushroom *OmniRetarget*
+
+### Side/Front support retargeting
+
+```powershell
+cd D:\GitHub\holosoma\src\holosoma_retargeting\holosoma_retargeting
+& D:\anaconda3\envs\omniretarget\python.exe `
+  .\examples\robot_retarget.py `
+  --data-path "D:\track_dataset\nokov_bvh\0822cc_lt_2" `
+  --task-type climbing `
+  --task-name "0822cc_lt_2" `
+  --data-format nokov `
+  --robot g1 `
+  --robot-config.robot-urdf-file "D:\GitHub\holosoma\src\holosoma_retargeting\holosoma_retargeting\models\g1_29dof_fist_pan\g1_29dof_fist_pan.urdf" `
+  --task-config.object-name mushroom `
+  --task-config.object-scale 1.0 `
+  --save-dir "D:\track_dataset\omniretarget_results"
+```
+
+### Play NOKOV G1 and mushroom with Viser
+
+```powershell
+cd D:\GitHub\holosoma\src\holosoma_retargeting\holosoma_retargeting
+& D:\anaconda3\envs\omniretarget\python.exe `
+  .\viser_player.py `
+  --qpos-npz "D:\track_dataset\omniretarget_results\0822cc_lt_2_original.npz" `
+  --robot-urdf "D:\GitHub\holosoma\src\holosoma_retargeting\holosoma_retargeting\models\g1_29dof_fist_pan\g1_29dof_fist_pan.urdf" `
+  --show-object `
+  --loop
+```
+
+## NOKOV G1 *OmniRetarget*
+
+### Side/Front support retargeting
+
+```powershell
+cd D:\GitHub\holosoma\src\holosoma_retargeting\holosoma_retargeting
+& D:\anaconda3\envs\omniretarget\python.exe `
+  .\examples\robot_retarget.py `
+  --data-path "D:\track_dataset\nokov_bvh\260630_lt" `
+  --task-type robot_only `
+  --task-name "lt_cc3" `
+  --data-format nokov `
+  --robot g1 `
+  --robot-config.robot-urdf-file "D:\GitHub\holosoma\src\holosoma_retargeting\holosoma_retargeting\models\g1_29dof_fist_pan\g1_29dof_fist_pan.urdf" `
+  --save-dir "D:\track_dataset\omniretarget_results" `
+  --task-config.ground-range -1.5 1.5 `
+  --task-config.ground-size 20 `
+  --retargeter.hand-sticking.enable `
+  --retargeter.hand-sticking.demo-joint-names LeftHand RightHand `
+  --retargeter.arm-straightness.enable `
+  --retargeter.arm-straightness.weight 10
+```
+
+### Play NOKOV G1 with Viser
+
+```powershell
+cd D:\GitHub\holosoma\src\holosoma_retargeting\holosoma_retargeting
+& D:\anaconda3\envs\omniretarget\python.exe `
+  .\viser_player.py `
+  --qpos-npz "D:\track_dataset\omniretarget_results\0822cc_lt_2_original.npz" `
+  --robot-urdf "D:\GitHub\holosoma\src\holosoma_retargeting\holosoma_retargeting\models\g1_29dof_fist_pan\g1_29dof_fist_pan.urdf" `
+  --loop
+```
+
+## Mushroom-Flare *OmniRetarget*
+
+### G1 flare retargeting (mushroom)
+
+```powershell
+cd D:\GitHub\holosoma\src\holosoma_retargeting\holosoma_retargeting
+& "D:\anaconda3\envs\omniretarget\python.exe" `
+  .\examples\robot_retarget.py `
+  --data-path "D:\track_dataset\marker53_optimized_ground.bvh" `
+  --task-type climbing `
+  --task-name "pommel_bvh-omniretarget" `
+  --data-format pommel `
+  --robot g1 `
+  --robot-config.robot-urdf-file "D:\GitHub\holosoma\src\holosoma_retargeting\holosoma_retargeting\models\g1_theshy\g1_theshy.urdf" `
+  --save-dir "D:\track_dataset\omniretarget_results" `
+  --task-config.object-name mushroom `
+  --task-config.object-mesh "D:\GitHub\holosoma\src\holosoma_retargeting\holosoma_retargeting\models\mushroom\mushroom_visual.obj" `
+  --task-config.pommel-reference-position 0.02315461 -0.64678669 0.24471219 `
+  --task-config.pommel-reference-scale 0.85 `
+  --task-config.pommel-z-compression 1 `
+  --task-config.pommel-human-radial-offset 0.02 `
+  --task-config.fixed-object-ground-shape 9 9 `
+  --task-config.fixed-object-ground-range -1.2 1.2 `
+  --task-config.no-fixed-object-surface-points-enabled `
+  --retargeter.activate-obj-non-penetration `
+  --retargeter.hand-tracking-point-offset 0 0 0 `
+  --retargeter.hand-sticking.no-enable `
+  --retargeter.arm-straightness.no-enable
+```
+
+### Play G1-mushroom with Viser
+
+```powershell
+cd D:\GitHub\holosoma\src\holosoma_retargeting\holosoma_retargeting
+& "D:\anaconda3\envs\omniretarget\python.exe" `
+  .\viser_player.py `
+  --robot-urdf "D:\GitHub\holosoma\src\holosoma_retargeting\holosoma_retargeting\models\g1_theshy\g1_theshy.urdf" `
+  --qpos-npz "D:\track_dataset\omniretarget_results\mushroom_R1_original.npz" `
+  --show-object `
+  --loop
+```
+
+### R1 flare retargeting (mushroom)
+
+```powershell
+cd D:\GitHub\holosoma\src\holosoma_retargeting\holosoma_retargeting
+& "D:\anaconda3\envs\omniretarget\python.exe" `
+  .\examples\robot_retarget.py `
+  --data-path "D:\track_dataset\marker53_optimized_ground.bvh" `
+  --task-type climbing `
+  --task-name "mushroom_R1" `
+  --data-format pommel `
+  --robot r1 `
+  --robot-config.robot-urdf-file "D:\GitHub\holosoma\src\holosoma_retargeting\holosoma_retargeting\models\r1\r1_26dof.urdf" `
+  --save-dir "D:\track_dataset\omniretarget_results" `
+  --task-config.object-name mushroom `
+  --task-config.object-mesh "D:\GitHub\holosoma\src\holosoma_retargeting\holosoma_retargeting\models\mushroom\mushroom_visual.obj" `
+  --task-config.pommel-reference-position 0.02315461 -0.64678669 0.24471219 `
+  --task-config.pommel-reference-scale 0.85 `
+  --task-config.pommel-z-compression 1 `
+  --task-config.pommel-human-radial-offset 0.02 `
+  --task-config.fixed-object-ground-shape 9 9 `
+  --task-config.fixed-object-ground-range -1.2 1.2 `
+  --task-config.fixed-object-surface-points-enabled `
+  --retargeter.activate-joint-limits `
+  --retargeter.activate-obj-non-penetration `
+  --retargeter.hand-tracking-point-offset 0 0 0 `
+  --retargeter.hand-sticking.no-enable `
+  --retargeter.arm-straightness.no-enable
+```
+
+### Play R1-mushroom with Viser
+
+cd D:\GitHub\holosoma\src\holosoma_retargeting\holosoma_retargeting
+& "D:\anaconda3\envs\omniretarget\python.exe" `
+  .\viser_player.py `
+  --robot-urdf "D:\GitHub\holosoma\src\holosoma_retargeting\holosoma_retargeting\models\r1\r1_26dof.urdf" `
+  --qpos-npz "D:\track_dataset\omniretarget_results\mushroom_R1_original.npz" `
+  --show-object `
+  --loop
+
+
+## Convert npz to RGMT_50Hz (require Extreme-RGMT virtual environment)
+
+```powershell
+cd D:\GitHub\RGMT_1
+& D:\anaconda3\envs\env_isaaclab\python.exe `
+  .\scripts\convert_omniretarget_npz.py `
+  --input "D:\track_dataset\omniretarget_results\pommel_bvh-omniretarget_original.npz" `
+  --output "D:\track_dataset\Extreme-RGMT_50Hz\flare_mushroom_0.85_50Hz.npz" `
+  --xml "D:\GitHub\holosoma\src\holosoma_retargeting\holosoma_retargeting\models\g1_theshy\g1_theshy.xml" `
+  --target-fps 50
+```
