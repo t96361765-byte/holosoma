@@ -415,6 +415,7 @@ cd D:\GitHub\holosoma\src\holosoma_retargeting\holosoma_retargeting
 
 ### Play R1-mushroom with Viser
 
+```powershell
 cd D:\GitHub\holosoma\src\holosoma_retargeting\holosoma_retargeting
 & "D:\anaconda3\envs\omniretarget\python.exe" `
   .\viser_player.py `
@@ -422,7 +423,7 @@ cd D:\GitHub\holosoma\src\holosoma_retargeting\holosoma_retargeting
   --qpos-npz "D:\track_dataset\omniretarget_results\mushroom_R1_original.npz" `
   --show-object `
   --loop
-
+```
 
 ## Convert npz to RGMT_50Hz (require Extreme-RGMT virtual environment)
 
