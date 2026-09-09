@@ -50,7 +50,7 @@ class TaskConfig:
     Disabled by default so the mushroom is represented only by its physical
     collision constraint. The sparse ground patch remains in the graph.
     """
-    fixed_object_sample_count: int = 100
+    fixed_object_sample_count: int = 50
 
     # Blender reference pose for marker53 pommel captures. This is the pose of
     # mushroom_visual in real_pommel.blend before the whole human/object pair
@@ -78,7 +78,9 @@ class TaskConfig:
 
     # Optional fixed-object contact sampling. These settings are used only when
     # fixed_object_surface_points_enabled is true.
-    fixed_object_upper_height_fraction: float = 0.55
+    # For mushroom_visual.obj, 0.72 gives local Z >= 0.121657 m,
+    # above the column and lower rim. The cutoff scales with the asset.
+    fixed_object_upper_height_fraction: float = 0.72
     fixed_object_upper_normal_z: float = 0.25
     fixed_object_upper_interior_radius: float = 1.0
     fixed_object_sampling_seed: int = 42

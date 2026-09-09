@@ -225,7 +225,6 @@ Please see the instructions for retargeting custom robot types: [ADD_ROBOT_TYPE_
 
 
 
-
 ## AMASS G1 *OmniRetarget*
 
 ### Prepare AMASS SMPL-X for OmniRetarget

@@ -209,7 +209,7 @@ def sample_fixed_object_contact_points(
     sample_count: int,
     task_config: TaskConfig,
 ) -> tuple[np.ndarray, dict[str, float | int]]:
-    """Sample the complete upper support cap uniformly by triangle area."""
+    """Sample upward cap faces above the height cutoff, weighted by area."""
     if sample_count < 4:
         raise ValueError("fixed_object_sample_count must be at least 4")
 
@@ -231,7 +231,9 @@ def sample_fixed_object_contact_points(
     if height_span <= 0 or np.any(xy_half_extent <= 0):
         raise ValueError(f"Object mesh has degenerate bounds: {mesh_file}")
 
-    normalized_height = (face_centers[:, 2] - bounds[0, 2]) / height_span
+    # Test the lowest vertex, not the face center: every sampled point must
+    # remain above the cutoff, including points near triangle boundaries.
+    normalized_height = (mesh.triangles[:, :, 2].min(axis=1) - bounds[0, 2]) / height_span
     xy_center = (bounds[0, :2] + bounds[1, :2]) / 2.0
     normalized_radius = np.linalg.norm((face_centers[:, :2] - xy_center) / xy_half_extent, axis=1)
     upper_surface = (
@@ -244,7 +246,7 @@ def sample_fixed_object_contact_points(
     points, _ = trimesh.sample.sample_surface(
         mesh,
         sample_count,
-        face_weight=upper_surface.astype(float),
+        face_weight=mesh.area_faces * upper_surface,
         seed=task_config.fixed_object_sampling_seed,
     )
 
