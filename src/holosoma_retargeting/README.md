@@ -302,9 +302,13 @@ cd D:\GitHub\holosoma\src\holosoma_retargeting\holosoma_retargeting
 cd D:\GitHub\holosoma\src\holosoma_retargeting\holosoma_retargeting
 & D:\anaconda3\envs\omniretarget\python.exe `
   .\viser_player.py `
-  --qpos-npz "D:\track_dataset\omniretarget_results\0822cc_lt_2_original.npz" `
-  --robot-urdf "D:\GitHub\holosoma\src\holosoma_retargeting\holosoma_retargeting\models\g1_29dof_fist_pan\g1_29dof_fist_pan.urdf" `
+  --qpos-npz "D:\track_dataset\omniretarget_results\0822zc_lt_2-Bodylt.npz" `
+  --robot-urdf "models\g1_theshy\g1_theshy.urdf" `
   --show-object `
+  --object-urdf "models/mushroom/mushroom_static.urdf" `
+  --no-assume-object-in-qpos `
+  --object-position 0 0 0.276493 `
+  --object-quaternion-wxyz 0.104680768438 0 0 0.994505875659 `
   --loop
 ```
 
