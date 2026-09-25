@@ -383,7 +383,7 @@ cd D:\GitHub\holosoma\src\holosoma_retargeting\holosoma_retargeting
 & "D:\anaconda3\envs\omniretarget\python.exe" `
   .\viser_player.py `
   --robot-urdf "D:\GitHub\holosoma\src\holosoma_retargeting\holosoma_retargeting\models\g1_theshy\g1_theshy.urdf" `
-  --qpos-npz "D:\track_dataset\omniretarget_results\mushroom_R1_original.npz" `
+  --qpos-npz "D:\track_dataset\omniretarget_results\mushroom_G1_theshy_flare.npz" `
   --show-object `
   --loop
 ```
@@ -432,7 +432,7 @@ cd D:\GitHub\holosoma\src\holosoma_retargeting\holosoma_retargeting
 ## Convert npz to RGMT_50Hz (require Extreme-RGMT virtual environment)
 
 ```powershell
-cd D:\GitHub\RGMT_1
+cd D:\GitHub\RGMT
 & D:\anaconda3\envs\env_isaaclab\python.exe `
   .\scripts\convert_omniretarget_npz.py `
   --input "D:\track_dataset\omniretarget_results\pommel_bvh-omniretarget_original.npz" `
